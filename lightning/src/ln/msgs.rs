@@ -4766,21 +4766,19 @@ mod tests {
 		let trampoline_payload = OutboundTrampolinePayload::LegacyBlindedPathEntry {
 			amt_to_forward: 150_000_000,
 			outgoing_cltv_value: 800_000,
-			payment_paths: vec![
-				BlindedPaymentPath::from_raw(
-					introduction_node,
-					blinding_point,
-					vec![],
-					BlindedPayInfo{
-						fee_base_msat: 500,
-						fee_proportional_millionths: 1_000,
-						cltv_expiry_delta: 36,
-						htlc_minimum_msat: 1,
-						htlc_maximum_msat: 500_000_000,
-						features: BlindedHopFeatures::empty(),
-					}
-				)
-			],
+			payment_paths: vec![BlindedPaymentPath::from_blinded_path_and_payinfo(
+				introduction_node,
+				blinding_point,
+				vec![],
+				BlindedPayInfo {
+					fee_base_msat: 500,
+					fee_proportional_millionths: 1_000,
+					cltv_expiry_delta: 36,
+					htlc_minimum_msat: 1,
+					htlc_maximum_msat: 500_000_000,
+					features: BlindedHopFeatures::empty(),
+				},
+			)],
 			invoice_features: Some(trampoline_features),
 		};
 		let serialized_payload = trampoline_payload.encode().to_lower_hex_string();
