@@ -2645,6 +2645,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				let outbound_payment = match source {
 					None => panic!("Outbound HTLCs should have a source"),
 					Some(&HTLCSource::PreviousHopData(_)) => false,
+					Some(&HTLCSource::TrampolineForward { .. }) => false,
 					Some(&HTLCSource::OutboundRoute { .. }) => true,
 				};
 				return Some(Balance::MaybeTimeoutClaimableHTLC {
@@ -2858,6 +2859,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 					let outbound_payment = match source {
 						None => panic!("Outbound HTLCs should have a source"),
 						Some(HTLCSource::PreviousHopData(_)) => false,
+						Some(HTLCSource::TrampolineForward { .. }) => false,
 						Some(HTLCSource::OutboundRoute { .. }) => true,
 					};
 					if outbound_payment {
@@ -3390,7 +3392,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					} else { false }
 				}));
 			}
-			self.counterparty_fulfilled_htlcs.insert(*claimed_htlc_id, *claimed_preimage);
+			let claimed = claimed_htlc_id.clone();
+			self.counterparty_fulfilled_htlcs.insert(claimed, *claimed_preimage);
 		}
 	}
 
