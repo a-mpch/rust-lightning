@@ -51,7 +51,11 @@ struct StoredWebhook {
 	_app_name: LSPS5AppName,
 	url: LSPS5WebhookUrl,
 	_counterparty_node_id: PublicKey,
+	// Timestamp used for tracking when the webhook was created / updated, or when the last notification was sent.
+	// This is used to determine if the webhook is stale and should be pruned.
 	last_used: LSPSDateTime,
+	// Map of last notification sent timestamps for each notification method.
+	// This is used to enforce notification cooldowns.
 	last_notification_sent: HashMap<WebhookNotificationMethod, LSPSDateTime>,
 }
 
@@ -60,8 +64,18 @@ struct StoredWebhook {
 pub struct LSPS5ServiceConfig {
 	/// Maximum number of webhooks allowed per client.
 	pub max_webhooks_per_client: u32,
-	/// Minimum time between sending the same notification type in hours (default: 24)
-	pub notification_cooldown_hours: Duration,
+}
+
+/// Default maximum number of webhooks allowed per client.
+pub const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
+/// Default notification cooldown time in hours.
+pub const DEFAULT_NOTIFICATION_COOLDOWN_HOURS: Duration = Duration::from_secs(60 * 60); // 1 hour
+
+// Default configuration for LSPS5 service.
+impl Default for LSPS5ServiceConfig {
+	fn default() -> Self {
+		Self { max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT }
+	}
 }
 
 /// Service-side handler for the [`bLIP-55 / LSPS5`] webhook registration protocol.
@@ -78,8 +92,6 @@ pub struct LSPS5ServiceConfig {
 ///   - `lsps5.remove_webhook` -> delete a named webhook or return [`app_name_not_found`] error.
 /// - Prune stale webhooks after a client has no open channels and no activity for at least
 /// [`MIN_WEBHOOK_RETENTION_DAYS`].
-/// - Rate-limit repeat notifications of the same method to a client by
-///   [`notification_cooldown_hours`].
 /// - Sign and enqueue outgoing webhook notifications:
 ///   - Construct JSON-RPC 2.0 Notification objects [`WebhookNotification`],
 ///   - Timestamp and LN-style zbase32-sign each payload,
@@ -94,7 +106,6 @@ pub struct LSPS5ServiceConfig {
 /// [`bLIP-55 / LSPS5`]: https://github.com/lightning/blips/pull/55/files
 /// [`max_webhooks_per_client`]: super::service::LSPS5ServiceConfig::max_webhooks_per_client
 /// [`app_name_not_found`]: super::msgs::LSPS5ProtocolError::AppNameNotFound
-/// [`notification_cooldown_hours`]: super::service::LSPS5ServiceConfig::notification_cooldown_hours
 /// [`WebhookNotification`]: super::msgs::WebhookNotification
 /// [`LSPS5ServiceEvent::SendWebhookNotification`]: super::event::LSPS5ServiceEvent::SendWebhookNotification
 /// [`app_name`]: super::msgs::LSPS5AppName
@@ -145,7 +156,7 @@ where
 		let should_prune = {
 			let last_pruning = self.last_pruning.lock().unwrap();
 			last_pruning.as_ref().map_or(true, |last_time| {
-				now.abs_diff(&last_time) > PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS.as_secs()
+				now.duration_since(&last_time) > PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS
 			})
 		};
 
@@ -158,6 +169,8 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: SetWebhookRequest,
 	) -> Result<(), LightningError> {
+		let mut message_queue_notifier = self.pending_messages.notifier();
+
 		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
@@ -172,7 +185,7 @@ where
 			Entry::Occupied(mut entry) => {
 				no_change = entry.get().url == params.webhook;
 				let (last_used, last_notification_sent) = if no_change {
-					(entry.get().last_used.clone(), entry.get().last_notification_sent.clone())
+					(entry.get().last_used, entry.get().last_notification_sent.clone())
 				} else {
 					(now, new_hash_map())
 				};
@@ -192,7 +205,7 @@ where
 						LSPS5Response::SetWebhookError(error.clone().into()),
 					)
 					.into();
-					self.pending_messages.enqueue(&counterparty_node_id, msg);
+					message_queue_notifier.enqueue(&counterparty_node_id, msg);
 					return Err(LightningError {
 						err: error.message().into(),
 						action: ErrorAction::IgnoreAndLog(Level::Info),
@@ -221,7 +234,7 @@ where
 					LSPS5Response::SetWebhookError(e.clone().into()),
 				)
 				.into();
-				self.pending_messages.enqueue(&counterparty_node_id, msg);
+				message_queue_notifier.enqueue(&counterparty_node_id, msg);
 				LightningError {
 					err: e.message().into(),
 					action: ErrorAction::IgnoreAndLog(Level::Info),
@@ -238,7 +251,7 @@ where
 			}),
 		)
 		.into();
-		self.pending_messages.enqueue(&counterparty_node_id, msg);
+		message_queue_notifier.enqueue(&counterparty_node_id, msg);
 		Ok(())
 	}
 
@@ -246,6 +259,8 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		_params: ListWebhooksRequest,
 	) -> Result<(), LightningError> {
+		let mut message_queue_notifier = self.pending_messages.notifier();
+
 		self.check_prune_stale_webhooks();
 
 		let webhooks = self.webhooks.lock().unwrap();
@@ -259,7 +274,7 @@ where
 
 		let response = ListWebhooksResponse { app_names, max_webhooks };
 		let msg = LSPS5Message::Response(request_id, LSPS5Response::ListWebhooks(response)).into();
-		self.pending_messages.enqueue(&counterparty_node_id, msg);
+		message_queue_notifier.enqueue(&counterparty_node_id, msg);
 
 		Ok(())
 	}
@@ -268,6 +283,8 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: RemoveWebhookRequest,
 	) -> Result<(), LightningError> {
+		let mut message_queue_notifier = self.pending_messages.notifier();
+
 		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
@@ -278,7 +295,7 @@ where
 				let msg =
 					LSPS5Message::Response(request_id, LSPS5Response::RemoveWebhook(response))
 						.into();
-				self.pending_messages.enqueue(&counterparty_node_id, msg);
+				message_queue_notifier.enqueue(&counterparty_node_id, msg);
 
 				return Ok(());
 			}
@@ -291,7 +308,7 @@ where
 		)
 		.into();
 
-		self.pending_messages.enqueue(&counterparty_node_id, msg);
+		message_queue_notifier.enqueue(&counterparty_node_id, msg);
 		return Err(LightningError {
 			err: error.message().into(),
 			action: ErrorAction::IgnoreAndLog(Level::Info),
@@ -312,10 +329,14 @@ where
 	/// This builds a [`WebhookNotificationMethod::LSPS5PaymentIncoming`] webhook notification, signs it with your
 	/// node key, and enqueues HTTP POSTs to all registered webhook URLs for that client.
 	///
+	/// This may fail if a similar notification was sent too recently,
+	/// violating the notification cooldown period defined in [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`].
+	///
 	/// # Parameters
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5PaymentIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5PaymentIncoming
+	/// [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`]: super::service::DEFAULT_NOTIFICATION_COOLDOWN_HOURS
 	pub fn notify_payment_incoming(&self, client_id: PublicKey) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::payment_incoming();
 		self.send_notifications_to_client_webhooks(client_id, notification)
@@ -329,11 +350,15 @@ where
 	/// the `timeout` block height, signs it, and enqueues HTTP POSTs to the client's
 	/// registered webhooks.
 	///
+	/// This may fail if a similar notification was sent too recently,
+	/// violating the notification cooldown period defined in [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`].
+	///
 	/// # Parameters
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	/// - `timeout`: the block height at which the channel contract will expire.
 	///
 	/// [`WebhookNotificationMethod::LSPS5ExpirySoon`]: super::msgs::WebhookNotificationMethod::LSPS5ExpirySoon
+	/// [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`]: super::service::DEFAULT_NOTIFICATION_COOLDOWN_HOURS
 	pub fn notify_expiry_soon(
 		&self, client_id: PublicKey, timeout: u32,
 	) -> Result<(), LSPS5ProtocolError> {
@@ -347,10 +372,14 @@ where
 	/// liquidity for `client_id`. Builds a [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`] notification,
 	/// signs it, and sends it to all of the client's registered webhook URLs.
 	///
+	/// This may fail if a similar notification was sent too recently,
+	/// violating the notification cooldown period defined in [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`].
+	///
 	/// # Parameters
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`]: super::msgs::WebhookNotificationMethod::LSPS5LiquidityManagementRequest
+	/// [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`]: super::service::DEFAULT_NOTIFICATION_COOLDOWN_HOURS
 	pub fn notify_liquidity_management_request(
 		&self, client_id: PublicKey,
 	) -> Result<(), LSPS5ProtocolError> {
@@ -364,10 +393,14 @@ where
 	/// for `client_id` while the client is offline. Builds a [`WebhookNotificationMethod::LSPS5OnionMessageIncoming`]
 	/// notification, signs it, and enqueues HTTP POSTs to each registered webhook.
 	///
+	/// This may fail if a similar notification was sent too recently,
+	/// violating the notification cooldown period defined in [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`].
+	///
 	/// # Parameters
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5OnionMessageIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5OnionMessageIncoming
+	/// [`DEFAULT_NOTIFICATION_COOLDOWN_HOURS`]: super::service::DEFAULT_NOTIFICATION_COOLDOWN_HOURS
 	pub fn notify_onion_message_incoming(
 		&self, client_id: PublicKey,
 	) -> Result<(), LSPS5ProtocolError> {
@@ -388,23 +421,31 @@ where
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 
-		for (app_name, webhook) in client_webhooks.iter_mut() {
-			if webhook
-				.last_notification_sent
-				.get(&notification.method)
-				.map(|last_sent| now.clone().abs_diff(&last_sent))
-				.map_or(true, |duration| {
-					duration >= self.config.notification_cooldown_hours.as_secs()
-				}) {
-				webhook.last_notification_sent.insert(notification.method.clone(), now.clone());
-				webhook.last_used = now.clone();
-				self.send_notification(
-					client_id,
-					app_name.clone(),
-					webhook.url.clone(),
-					notification.clone(),
-				)?;
+		// We must avoid sending multiple notifications of the same method
+		// (other than lsps5.webhook_registered) close in time.
+		if notification.method != WebhookNotificationMethod::LSPS5WebhookRegistered {
+			let rate_limit_applies = client_webhooks.iter().any(|(_, webhook)| {
+				webhook
+					.last_notification_sent
+					.get(&notification.method)
+					.map(|last_sent| now.duration_since(&last_sent))
+					.map_or(false, |duration| duration < DEFAULT_NOTIFICATION_COOLDOWN_HOURS)
+			});
+
+			if rate_limit_applies {
+				return Err(LSPS5ProtocolError::SlowDownError);
 			}
+		}
+
+		for (app_name, webhook) in client_webhooks.iter_mut() {
+			webhook.last_notification_sent.insert(notification.method.clone(), now);
+			webhook.last_used = now;
+			self.send_notification(
+				client_id,
+				app_name.clone(),
+				webhook.url.clone(),
+				notification.clone(),
+			)?;
 		}
 		Ok(())
 	}
@@ -462,7 +503,7 @@ where
 		webhooks.retain(|client_id, client_webhooks| {
 			if !self.client_has_open_channel(client_id) {
 				client_webhooks.retain(|_, webhook| {
-					now.abs_diff(&webhook.last_used) < MIN_WEBHOOK_RETENTION_DAYS.as_secs()
+					now.duration_since(&webhook.last_used) < MIN_WEBHOOK_RETENTION_DAYS
 				});
 				!client_webhooks.is_empty()
 			} else {
@@ -480,6 +521,15 @@ where
 			.list_channels()
 			.iter()
 			.any(|c| c.is_usable && c.counterparty.node_id == *client_id)
+	}
+
+	pub(crate) fn peer_connected(&self, counterparty_node_id: &PublicKey) {
+		let mut webhooks = self.webhooks.lock().unwrap();
+		if let Some(client_webhooks) = webhooks.get_mut(counterparty_node_id) {
+			for webhook in client_webhooks.values_mut() {
+				webhook.last_notification_sent.clear();
+			}
+		}
 	}
 }
 
