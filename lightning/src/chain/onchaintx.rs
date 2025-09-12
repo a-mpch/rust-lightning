@@ -23,7 +23,7 @@ use bitcoin::secp256k1::{ecdsa::Signature, Secp256k1};
 use bitcoin::transaction::OutPoint as BitcoinOutPoint;
 use bitcoin::transaction::Transaction;
 
-use crate::chain::chaininterface::{compute_feerate_sat_per_1000_weight, ConfirmationTarget};
+use crate::chain::chaininterface::ConfirmationTarget;
 use crate::chain::chaininterface::{BroadcasterInterface, FeeEstimator, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::ANTI_REORG_DELAY;
 use crate::chain::package::{PackageSolvingData, PackageTemplate};
@@ -670,19 +670,8 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 
 					let fee_sat = input_amount_sats - tx.output.iter()
 						.map(|output| output.value.to_sat()).sum::<u64>();
-					let commitment_tx_feerate_sat_per_1000_weight =
-						compute_feerate_sat_per_1000_weight(fee_sat, tx.weight().to_wu());
 					let package_target_feerate_sat_per_1000_weight = cached_request
 						.compute_package_feerate(fee_estimator, conf_target, feerate_strategy);
-					if commitment_tx_feerate_sat_per_1000_weight >= package_target_feerate_sat_per_1000_weight {
-						log_debug!(logger, "Pre-signed commitment {} already has feerate {} sat/kW above required {} sat/kW",
-							tx.compute_txid(), commitment_tx_feerate_sat_per_1000_weight,
-							package_target_feerate_sat_per_1000_weight);
-						// The commitment transaction already meets the required feerate and doesn't
-						// need a CPFP. We still want to return something other than the event to
-						// register the claim.
-						return Some((new_timer, 0, OnchainClaim::Tx(MaybeSignedTransaction(tx))));
-					}
 
 					// We'll locate an anchor output we can spend within the commitment transaction.
 					let channel_parameters = output.channel_parameters.as_ref()
@@ -723,7 +712,8 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 	}
 
 	#[rustfmt::skip]
-	pub fn abandon_claim(&mut self, outpoint: &BitcoinOutPoint) {
+	pub fn abandon_claim(&mut self, outpoint: &BitcoinOutPoint) -> bool {
+		let mut found_claim = false;
 		let claim_id = self.claimable_outpoints.get(outpoint).map(|(claim_id, _)| *claim_id)
 			.or_else(|| {
 				self.pending_claim_requests.iter()
@@ -733,13 +723,23 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 		if let Some(claim_id) = claim_id {
 			if let Some(claim) = self.pending_claim_requests.remove(&claim_id) {
 				for outpoint in claim.outpoints() {
-					self.claimable_outpoints.remove(outpoint);
+					if self.claimable_outpoints.remove(outpoint).is_some() {
+						found_claim = true;
+					}
 				}
 			}
 		} else {
-			self.locktimed_packages.values_mut().for_each(|claims|
-				claims.retain(|claim| !claim.outpoints().contains(&outpoint)));
+			self.locktimed_packages.values_mut().for_each(|claims| {
+				claims.retain(|claim| {
+					let includes_outpoint = claim.outpoints().contains(&outpoint);
+					if includes_outpoint {
+						found_claim = true;
+					}
+					!includes_outpoint
+				})
+			});
 		}
+		found_claim
 	}
 
 	/// Upon channelmonitor.block_connected(..) or upon provision of a preimage on the forward link
@@ -1109,7 +1109,7 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 	pub(super) fn transaction_unconfirmed<B: Deref, F: Deref, L: Logger>(
 		&mut self,
 		txid: &Txid,
-		broadcaster: B,
+		broadcaster: &B,
 		conf_target: ConfirmationTarget,
 		destination_script: &Script,
 		fee_estimator: &LowerBoundedFeeEstimator<F>,
@@ -1135,7 +1135,7 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 
 	#[rustfmt::skip]
 	pub(super) fn block_disconnected<B: Deref, F: Deref, L: Logger>(
-		&mut self, height: u32, broadcaster: B, conf_target: ConfirmationTarget,
+		&mut self, height: u32, broadcaster: &B, conf_target: ConfirmationTarget,
 		destination_script: &Script, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	)
 		where B::Target: BroadcasterInterface,

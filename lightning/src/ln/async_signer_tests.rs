@@ -1010,7 +1010,7 @@ fn do_test_async_holder_signatures(anchors: bool, remote_commitment: bool) {
 
 	// Route an HTLC and set the signer as unavailable.
 	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes(&nodes, 0, 1);
-	route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	let (_, payment_hash, _, _) = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
 
 	if remote_commitment {
 		let message = "Channel force-closed".to_owned();
@@ -1051,6 +1051,9 @@ fn do_test_async_holder_signatures(anchors: bool, remote_commitment: bool) {
 			&nodes[0].logger,
 		);
 	}
+	if anchors {
+		handle_bump_close_event(closing_node);
+	}
 
 	let commitment_tx = {
 		let mut txn = closing_node.tx_broadcaster.txn_broadcast();
@@ -1083,16 +1086,14 @@ fn do_test_async_holder_signatures(anchors: bool, remote_commitment: bool) {
 	nodes[0].disable_channel_signer_op(&node_b_id, &chan_id, sign_htlc_op);
 	mine_transaction(&nodes[0], &commitment_tx);
 
-	check_added_monitors(&nodes[0], 1);
 	check_closed_broadcast(&nodes[0], 1, true);
-	check_closed_event(
-		&nodes[0],
-		1,
-		ClosureReason::CommitmentTxConfirmed,
-		false,
-		&[node_b_id],
-		100_000,
-	);
+	check_added_monitors(&nodes[0], 1);
+	let closure_reason = if remote_commitment {
+		ClosureReason::CommitmentTxConfirmed
+	} else {
+		ClosureReason::HTLCsTimedOut { payment_hash: Some(payment_hash) }
+	};
+	check_closed_event(&nodes[0], 1, closure_reason, false, &[node_b_id], 100_000);
 
 	// If the counterparty broadcast its latest commitment, we need to mine enough blocks for the
 	// HTLC timeout.
@@ -1395,6 +1396,7 @@ fn test_no_disconnect_while_async_commitment_signed_expecting_remote_revoke_and_
 	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], payment_amount);
 	nodes[1].node.claim_funds(preimage);
 	check_added_monitors(&nodes[1], 1);
+	expect_payment_claimed!(nodes[1], payment_hash, payment_amount);
 
 	// We'll disable signing counterparty commitments on the payment sender.
 	nodes[0].disable_channel_signer_op(&node_b_id, &chan_id, SignerOp::SignCounterpartyCommitment);
@@ -1403,6 +1405,7 @@ fn test_no_disconnect_while_async_commitment_signed_expecting_remote_revoke_and_
 	// the `commitment_signed` is no longer pending.
 	let mut update = get_htlc_update_msgs!(&nodes[1], node_a_id);
 	nodes[0].node.handle_update_fulfill_htlc(node_b_id, update.update_fulfill_htlcs.remove(0));
+	expect_payment_sent(&nodes[0], preimage, None, false, false);
 	nodes[0].node.handle_commitment_signed_batch_test(node_b_id, &update.commitment_signed);
 	check_added_monitors(&nodes[0], 1);
 
@@ -1426,7 +1429,4 @@ fn test_no_disconnect_while_async_commitment_signed_expecting_remote_revoke_and_
 	};
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().into_iter().any(has_disconnect_event));
-
-	expect_payment_sent(&nodes[0], preimage, None, false, false);
-	expect_payment_claimed!(nodes[1], payment_hash, payment_amount);
 }

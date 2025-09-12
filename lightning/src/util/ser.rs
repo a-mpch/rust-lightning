@@ -1084,6 +1084,7 @@ impl_for_vec!((A, B), A, B);
 impl_for_vec!(SerialId);
 impl_for_vec!(NegotiatedTxInput);
 impl_for_vec!(InteractiveTxOutput);
+impl_for_vec!(crate::ln::our_peer_storage::PeerStorageMonitorHolder);
 impl_writeable_for_vec!(&crate::routing::router::BlindedTail);
 impl_readable_for_vec!(crate::routing::router::BlindedTail);
 impl_for_vec!(crate::routing::router::TrampolineHop);
@@ -1673,63 +1674,6 @@ impl Readable for Duration {
 		let secs = Readable::read(r)?;
 		let nanos = Readable::read(r)?;
 		Ok(Duration::new(secs, nanos))
-	}
-}
-
-/// A wrapper for a `Transaction` which can only be constructed with [`TransactionU16LenLimited::new`]
-/// if the `Transaction`'s consensus-serialized length is <= u16::MAX.
-///
-/// Use [`TransactionU16LenLimited::into_transaction`] to convert into the contained `Transaction`.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct TransactionU16LenLimited(Transaction);
-
-impl TransactionU16LenLimited {
-	/// Constructs a new `TransactionU16LenLimited` from a `Transaction` only if it's consensus-
-	/// serialized length is <= u16::MAX.
-	pub fn new(transaction: Transaction) -> Result<Self, ()> {
-		if transaction.serialized_length() > (u16::MAX as usize) {
-			Err(())
-		} else {
-			Ok(Self(transaction))
-		}
-	}
-
-	/// Consumes this `TransactionU16LenLimited` and returns its contained `Transaction`.
-	pub fn into_transaction(self) -> Transaction {
-		self.0
-	}
-
-	/// Returns a reference to the contained `Transaction`
-	pub fn as_transaction(&self) -> &Transaction {
-		&self.0
-	}
-}
-
-impl Writeable for Option<TransactionU16LenLimited> {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		match self {
-			Some(tx) => {
-				(tx.0.serialized_length() as u16).write(w)?;
-				tx.0.write(w)
-			},
-			None => 0u16.write(w),
-		}
-	}
-}
-
-impl Readable for Option<TransactionU16LenLimited> {
-	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
-		let len = <u16 as Readable>::read(r)?;
-		if len == 0 {
-			return Ok(None);
-		}
-		let mut tx_reader = FixedLengthReader::new(r, len as u64);
-		let tx: Transaction = Readable::read(&mut tx_reader)?;
-		if tx_reader.bytes_remain() {
-			Err(DecodeError::BadLengthDescriptor)
-		} else {
-			Ok(Some(TransactionU16LenLimited(tx)))
-		}
 	}
 }
 

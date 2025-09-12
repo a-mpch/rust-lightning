@@ -1,3 +1,12 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -181,7 +190,7 @@ pub struct LiquidityManager<
 	lsps2_service_handler: Option<LSPS2ServiceHandler<CM>>,
 	lsps2_client_handler: Option<LSPS2ClientHandler<ES>>,
 	lsps5_service_handler: Option<LSPS5ServiceHandler<CM, NS, TP>>,
-	lsps5_client_handler: Option<LSPS5ClientHandler<ES, TP>>,
+	lsps5_client_handler: Option<LSPS5ClientHandler<ES>>,
 	service_config: Option<LiquidityServiceConfig>,
 	_client_config: Option<LiquidityClientConfig>,
 	best_block: RwLock<Option<BestBlock>>,
@@ -276,12 +285,11 @@ where
 
 		let lsps5_client_handler = client_config.as_ref().and_then(|config| {
 			config.lsps5_client_config.as_ref().map(|config| {
-				LSPS5ClientHandler::new_with_time_provider(
+				LSPS5ClientHandler::new(
 					entropy_source.clone(),
 					Arc::clone(&pending_messages),
 					Arc::clone(&pending_events),
 					config.clone(),
-					time_provider.clone(),
 				)
 			})
 		});
@@ -411,7 +419,7 @@ where
 	/// Returns a reference to the LSPS5 client-side handler.
 	///
 	/// The returned hendler allows to initiate the LSPS5 client-side flow. That is, it allows to
-	pub fn lsps5_client_handler(&self) -> Option<&LSPS5ClientHandler<ES, TP>> {
+	pub fn lsps5_client_handler(&self) -> Option<&LSPS5ClientHandler<ES>> {
 		self.lsps5_client_handler.as_ref()
 	}
 
@@ -633,13 +641,15 @@ where
 				LSPSMessage::from_str_with_id_map(&msg.payload, &mut request_id_to_method_map)
 			}
 			.map_err(|_| {
+				let mut message_queue_notifier = self.pending_messages.notifier();
+
 				let error = LSPSResponseError {
 					code: JSONRPC_INVALID_MESSAGE_ERROR_CODE,
 					message: JSONRPC_INVALID_MESSAGE_ERROR_MESSAGE.to_string(),
 					data: None,
 				};
 
-				self.pending_messages.enqueue(&sender_node_id, LSPSMessage::Invalid(error));
+				message_queue_notifier.enqueue(&sender_node_id, LSPSMessage::Invalid(error));
 				self.ignored_peers.write().unwrap().insert(sender_node_id);
 				let err = format!(
 					"Failed to deserialize invalid LSPS message. Ignoring peer {} from now on.",
@@ -711,10 +721,19 @@ where
 		if let Some(lsps2_service_handler) = self.lsps2_service_handler.as_ref() {
 			lsps2_service_handler.peer_disconnected(counterparty_node_id);
 		}
+
+		if let Some(lsps5_service_handler) = self.lsps5_service_handler.as_ref() {
+			lsps5_service_handler.peer_disconnected(&counterparty_node_id);
+		}
 	}
 	fn peer_connected(
-		&self, _: bitcoin::secp256k1::PublicKey, _: &lightning::ln::msgs::Init, _: bool,
+		&self, counterparty_node_id: bitcoin::secp256k1::PublicKey, _: &lightning::ln::msgs::Init,
+		_: bool,
 	) -> Result<(), ()> {
+		if let Some(lsps5_service_handler) = self.lsps5_service_handler.as_ref() {
+			lsps5_service_handler.peer_connected(&counterparty_node_id);
+		}
+
 		Ok(())
 	}
 }

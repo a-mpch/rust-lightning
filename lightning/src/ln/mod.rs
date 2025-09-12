@@ -18,6 +18,7 @@ pub mod channel_keys;
 pub mod channel_state;
 pub mod channelmanager;
 mod features;
+pub mod funding;
 pub mod inbound_payment;
 pub mod msgs;
 pub mod onion_payment;
@@ -60,7 +61,7 @@ pub use onion_utils::process_onion_failure;
 #[cfg(fuzzing)]
 pub use onion_utils::AttributionData;
 
-#[cfg(all(test, async_payments))]
+#[cfg(test)]
 #[allow(unused_mut)]
 mod async_payments_tests;
 #[cfg(test)]
@@ -77,7 +78,7 @@ pub mod bolt11_payment_tests;
 mod chanmon_update_fail_tests;
 #[cfg(test)]
 #[allow(unused_mut)]
-mod channel_acceptance_tests;
+mod channel_open_tests;
 #[cfg(test)]
 #[allow(unused_mut)]
 mod channel_type_tests;

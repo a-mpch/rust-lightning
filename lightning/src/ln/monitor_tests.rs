@@ -82,8 +82,8 @@ fn chanmon_fail_from_stale_commitment() {
 	// Don't bother delivering the new HTLC add/commits, instead confirming the pre-HTLC commitment
 	// transaction for nodes[1].
 	mine_transaction(&nodes[1], &bs_txn[0]);
-	check_added_monitors!(nodes[1], 1);
 	check_closed_broadcast!(nodes[1], true);
+	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [nodes[2].node.get_our_node_id()], 100000);
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
 
@@ -138,9 +138,9 @@ fn revoked_output_htlc_resolution_timing() {
 
 	// Confirm the revoked commitment transaction, closing the channel.
 	mine_transaction(&nodes[1], &revoked_local_txn[0]);
+	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [nodes[0].node.get_our_node_id()], 1000000);
-	check_closed_broadcast!(nodes[1], true);
 
 	// Two justice transactions will be broadcast, one on the unpinnable, revoked to_self output,
 	// and one on the pinnable revoked HTLC output.
@@ -658,14 +658,14 @@ fn do_test_claim_value_force_close(anchors: bool, prev_commitment_tx: bool) {
 	assert_eq!(remote_txn[0].output[b_broadcast_txn[0].input[0].previous_output.vout as usize].value.to_sat(), 3_000);
 	assert_eq!(remote_txn[0].output[b_broadcast_txn[1].input[0].previous_output.vout as usize].value.to_sat(), 4_000);
 
-	assert!(nodes[0].node.list_channels().is_empty());
 	check_closed_broadcast!(nodes[0], true);
 	check_added_monitors!(nodes[0], 1);
 	check_closed_event!(nodes[0], 1, ClosureReason::CommitmentTxConfirmed, [nodes[1].node.get_our_node_id()], 1000000);
-	assert!(nodes[1].node.list_channels().is_empty());
+	assert!(nodes[0].node.list_channels().is_empty());
 	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [nodes[0].node.get_our_node_id()], 1000000);
+	assert!(nodes[1].node.list_channels().is_empty());
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 
@@ -896,6 +896,9 @@ fn do_test_balances_on_local_commitment_htlcs(anchors: bool) {
 	check_closed_broadcast!(nodes[0], true);
 	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
 	check_closed_event!(nodes[0], 1, reason, [nodes[1].node.get_our_node_id()], 1000000);
+	if anchors {
+		handle_bump_close_event(&nodes[0]);
+	}
 	let commitment_tx = {
 		let mut txn = nodes[0].tx_broadcaster.unique_txn_broadcast();
 		assert_eq!(txn.len(), 1);
@@ -905,9 +908,15 @@ fn do_test_balances_on_local_commitment_htlcs(anchors: bool) {
 	};
 	let commitment_tx_conf_height_a = block_from_scid(mine_transaction(&nodes[0], &commitment_tx));
 	if nodes[0].connect_style.borrow().updates_best_block_first() {
+		if anchors {
+			handle_bump_close_event(&nodes[0]);
+		}
 		let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
-		assert_eq!(txn.len(), 1);
+		assert_eq!(txn.len(), if anchors { 2 } else { 1 });
 		assert_eq!(txn[0].compute_txid(), commitment_tx.compute_txid());
+		if anchors {
+			check_spends!(txn[1], txn[0]);  // Anchor output spend.
+		}
 	}
 
 	let htlc_balance_known_preimage = Balance::MaybeTimeoutClaimableHTLC {
@@ -935,8 +944,8 @@ fn do_test_balances_on_local_commitment_htlcs(anchors: bool) {
 
 	// Get nodes[1]'s HTLC claim tx for the second HTLC
 	mine_transaction(&nodes[1], &commitment_tx);
-	check_added_monitors!(nodes[1], 1);
 	check_closed_broadcast!(nodes[1], true);
+	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [nodes[0].node.get_our_node_id()], 1000000);
 	let bs_htlc_claim_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(bs_htlc_claim_txn.len(), 1);
@@ -1153,16 +1162,16 @@ fn test_no_preimage_inbound_htlc_balances() {
 
 	mine_transaction(&nodes[0], &as_txn[0]);
 	nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
-	check_added_monitors!(nodes[0], 1);
 	check_closed_broadcast!(nodes[0], true);
+	check_added_monitors!(nodes[0], 1);
 	check_closed_event!(nodes[0], 1, ClosureReason::CommitmentTxConfirmed, [nodes[1].node.get_our_node_id()], 1000000);
 
 	assert_eq!(as_pre_spend_claims,
 		sorted_vec(nodes[0].chain_monitor.chain_monitor.get_monitor(chan_id).unwrap().get_claimable_balances()));
 
 	mine_transaction(&nodes[1], &as_txn[0]);
-	check_added_monitors!(nodes[1], 1);
 	check_closed_broadcast!(nodes[1], true);
+	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [nodes[0].node.get_our_node_id()], 1000000);
 
 	let node_b_commitment_claimable = nodes[1].best_block_info().1 + ANTI_REORG_DELAY - 1;
@@ -1398,14 +1407,22 @@ fn do_test_revoked_counterparty_commitment_balances(anchors: bool, confirm_htlc_
 	});
 	assert!(failed_payments.is_empty());
 	match &events[0] {
-		Event::ChannelClosed { reason: ClosureReason::HTLCsTimedOut, .. } => {},
+		Event::ChannelClosed { reason: ClosureReason::HTLCsTimedOut { .. }, .. } => {},
 		_ => panic!(),
 	}
 
 	connect_blocks(&nodes[1], htlc_cltv_timeout + 1 - 10);
 	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors!(nodes[1], 1);
-	check_closed_event!(nodes[1], 1, ClosureReason::HTLCsTimedOut, [nodes[0].node.get_our_node_id()], 1000000);
+	check_closed_events(&nodes[1], &[ExpectedCloseEvent {
+		channel_capacity_sats: Some(1_000_000),
+		channel_id: Some(chan_id),
+		counterparty_node_id: Some(nodes[0].node.get_our_node_id()),
+		discard_funding: false,
+		reason: None, // Could be due to any HTLC timing out, so don't bother checking
+		channel_funding_txo: None,
+		user_channel_id: None,
+	}]);
 
 	// Prior to channel closure, B considers the preimage HTLC as its own, and otherwise only
 	// lists the two on-chain timeout-able HTLCs as claimable balances.
@@ -2486,6 +2503,7 @@ fn do_test_yield_anchors_events(have_htlcs: bool) {
 		nodes[1].node.force_close_broadcasting_latest_txn(&chan_id, &nodes[0].node.get_our_node_id(), "".to_string()).unwrap();
 	}
 	{
+		handle_bump_close_event(&nodes[1]);
 		let txn = nodes[1].tx_broadcaster.txn_broadcast();
 		assert_eq!(txn.len(), 1);
 		check_spends!(txn[0], funding_tx);
@@ -2553,15 +2571,18 @@ fn do_test_yield_anchors_events(have_htlcs: bool) {
 	}
 
 	{
+		if nodes[1].connect_style.borrow().updates_best_block_first() {
+			handle_bump_close_event(&nodes[1]);
+		}
 		let mut txn = nodes[1].tx_broadcaster.unique_txn_broadcast();
 		// Both HTLC claims are pinnable at this point,
 		// and will be broadcast in a single transaction.
-		assert_eq!(txn.len(), if nodes[1].connect_style.borrow().updates_best_block_first() { 2 } else { 1 });
+		assert_eq!(txn.len(), if nodes[1].connect_style.borrow().updates_best_block_first() { 3 } else { 1 });
 		if nodes[1].connect_style.borrow().updates_best_block_first() {
-			let new_commitment_tx = txn.remove(0);
-			check_spends!(new_commitment_tx, funding_tx);
+			check_spends!(txn[1], funding_tx);
+			check_spends!(txn[2], txn[1]);  // Anchor output spend.
 		}
-		let htlc_claim_tx = txn.pop().unwrap();
+		let htlc_claim_tx = &txn[0];
 		assert_eq!(htlc_claim_tx.input.len(), 2);
 		assert_eq!(htlc_claim_tx.input[0].previous_output.vout, 2);
 		assert_eq!(htlc_claim_tx.input[1].previous_output.vout, 3);
@@ -2722,8 +2743,8 @@ fn test_anchors_aggregated_revoked_htlc_tx() {
 	for node in &nodes {
 		mine_transactions(node, &[&revoked_commitment_txs[0], &anchor_txs[0], &revoked_commitment_txs[1], &anchor_txs[1]]);
 	}
-	check_added_monitors!(&nodes[0], 2);
 	check_closed_broadcast(&nodes[0], 2, true);
+	check_added_monitors!(&nodes[0], 2);
 	check_closed_event!(&nodes[0], 2, ClosureReason::CommitmentTxConfirmed, [nodes[1].node.get_our_node_id(); 2], 1000000);
 
 	// Alice should detect the confirmed revoked commitments, and attempt to claim all of the
@@ -2952,6 +2973,7 @@ fn do_test_anchors_monitor_fixes_counterparty_payment_script_on_reload(confirm_c
 	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
 	check_closed_event!(&nodes[0], 1, reason, false,
 		 [nodes[1].node.get_our_node_id()], 100000);
+	handle_bump_close_event(&nodes[0]);
 
 	let commitment_tx = {
 		let mut txn = nodes[0].tx_broadcaster.unique_txn_broadcast();
@@ -2967,6 +2989,7 @@ fn do_test_anchors_monitor_fixes_counterparty_payment_script_on_reload(confirm_c
 		// with the incorrect P2WPKH script but reading it with the correct P2WSH script.
 		*nodes[1].chain_monitor.expect_monitor_round_trip_fail.lock().unwrap() = Some(chan_id);
 		let commitment_tx_conf_height = block_from_scid(mine_transaction(&nodes[1], &commitment_tx));
+		check_closed_broadcast(&nodes[1], 1, true);
 		let serialized_monitor = get_monitor!(nodes[1], chan_id).encode();
 		reload_node!(nodes[1], user_config, &nodes[1].node.encode(), &[&serialized_monitor], persister, chain_monitor, node_deserialized);
 		commitment_tx_conf_height
@@ -2974,8 +2997,8 @@ fn do_test_anchors_monitor_fixes_counterparty_payment_script_on_reload(confirm_c
 		let serialized_monitor = get_monitor!(nodes[1], chan_id).encode();
 		reload_node!(nodes[1], user_config, &nodes[1].node.encode(), &[&serialized_monitor], persister, chain_monitor, node_deserialized);
 		let commitment_tx_conf_height = block_from_scid(mine_transaction(&nodes[1], &commitment_tx));
-		check_added_monitors(&nodes[1], 1);
 		check_closed_broadcast(&nodes[1], 1, true);
+		check_added_monitors(&nodes[1], 1);
 		commitment_tx_conf_height
 	};
 	check_closed_event!(&nodes[1], 1, ClosureReason::CommitmentTxConfirmed, false,
@@ -3036,6 +3059,9 @@ fn do_test_monitor_claims_with_random_signatures(anchors: bool, confirm_counterp
 	get_monitor!(closing_node, chan_id).broadcast_latest_holder_commitment_txn(
 		&closing_node.tx_broadcaster, &closing_node.fee_estimator, &closing_node.logger
 	);
+	if anchors {
+		handle_bump_close_event(&closing_node);
+	}
 
 	// The commitment transaction comes first.
 	let commitment_tx = {
@@ -3046,13 +3072,14 @@ fn do_test_monitor_claims_with_random_signatures(anchors: bool, confirm_counterp
 	};
 
 	mine_transaction(closing_node, &commitment_tx);
-	check_added_monitors!(closing_node, 1);
 	check_closed_broadcast!(closing_node, true);
-	check_closed_event!(closing_node, 1, ClosureReason::CommitmentTxConfirmed, [other_node.node.get_our_node_id()], 1_000_000);
+	check_added_monitors!(closing_node, 1);
+	let message = "ChannelMonitor-initiated commitment transaction broadcast".to_string();
+	check_closed_event!(closing_node, 1, ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message }, [other_node.node.get_our_node_id()], 1_000_000);
 
 	mine_transaction(other_node, &commitment_tx);
-	check_added_monitors!(other_node, 1);
 	check_closed_broadcast!(other_node, true);
+	check_added_monitors!(other_node, 1);
 	check_closed_event!(other_node, 1, ClosureReason::CommitmentTxConfirmed, [closing_node.node.get_our_node_id()], 1_000_000);
 
 	// If we update the best block to the new height before providing the confirmed transactions,
@@ -3210,4 +3237,66 @@ fn test_update_replay_panics() {
 	// ...and finally ensure that applying all the updates succeeds.
 	monitor.update_monitor(&updates[2], &nodes[1].tx_broadcaster, &nodes[1].fee_estimator, &nodes[1].logger).unwrap();
 	monitor.update_monitor(&updates[3], &nodes[1].tx_broadcaster, &nodes[1].fee_estimator, &nodes[1].logger).unwrap();
+}
+
+#[test]
+fn test_claim_event_never_handled() {
+	// When a payment is claimed, the `ChannelMonitorUpdate` containing the payment preimage goes
+	// out and when it completes the `PaymentClaimed` event is generated. If the channel then
+	// progresses forward a few steps, the payment preimage will then eventually be removed from
+	// the channel. By that point, we have to make sure that the `PaymentClaimed` event has been
+	// handled (which ensures the user has maked the payment received).
+	// Otherwise, it is possible that, on restart, we load with a stale `ChannelManager` which
+	// doesn't have the `PaymentClaimed` event and it needs to rebuild it from the
+	// `ChannelMonitor`'s payment information and preimage.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let persister;
+	let new_chain_mon;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes_1_reload;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let init_node_ser = nodes[1].node.encode();
+
+	let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	// Send the payment we'll ultimately test the PaymentClaimed event for.
+	let (preimage_a, payment_hash_a, ..) = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	nodes[1].node.claim_funds(preimage_a);
+	check_added_monitors(&nodes[1], 1);
+
+	let mut updates = get_htlc_update_msgs(&nodes[1], &node_a_id);
+	nodes[0].node.handle_update_fulfill_htlc(node_b_id, updates.update_fulfill_htlcs.remove(0));
+	expect_payment_sent(&nodes[0], preimage_a, None, false, false);
+
+	nodes[0].node.handle_commitment_signed_batch_test(node_b_id, &updates.commitment_signed);
+	check_added_monitors(&nodes[0], 1);
+
+	// Once the `PaymentClaimed` event is generated, further RAA `ChannelMonitorUpdate`s will be
+	// blocked until it is handled, ensuring we never get far enough to remove the preimage.
+	let (raa, cs) = get_revoke_commit_msgs(&nodes[0], &node_b_id);
+	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa);
+	nodes[1].node.handle_commitment_signed_batch_test(node_a_id, &cs);
+	check_added_monitors(&nodes[1], 0);
+
+	// The last RAA here should be blocked waiting on us to handle the PaymentClaimed event before
+	// continuing. Otherwise, we'd be able to make enough progress that the payment preimage is
+	// removed from node A's `ChannelMonitor`. This leaves us unable to make further progress.
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+
+	// Finally, reload node B with an empty `ChannelManager` and check that we get the
+	// `PaymentClaimed` event.
+	let chan_0_monitor_serialized = get_monitor!(nodes[1], chan.2).encode();
+	let mons = &[&chan_0_monitor_serialized[..]];
+	reload_node!(nodes[1], &init_node_ser, mons, persister, new_chain_mon, nodes_1_reload);
+
+	expect_payment_claimed!(nodes[1], payment_hash_a, 1_000_000);
+	// The reload logic spuriously generates a redundant payment preimage-containing
+	// `ChannelMonitorUpdate`.
+	check_added_monitors(&nodes[1], 2);
 }

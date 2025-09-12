@@ -30,12 +30,11 @@ use bitcoin::hashes::{Hash, HashEngine, HmacEngine};
 
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin::{secp256k1, Sequence};
-#[cfg(splicing)]
-use bitcoin::{ScriptBuf, TxIn, Weight};
+use bitcoin::{secp256k1, Sequence, SignedAmount};
 
-use crate::blinded_path::message::MessageForwardNode;
-use crate::blinded_path::message::{AsyncPaymentsContext, OffersContext};
+use crate::blinded_path::message::{
+	AsyncPaymentsContext, BlindedMessagePath, MessageForwardNode, OffersContext,
+};
 use crate::blinded_path::payment::{
 	AsyncBolt12OfferContext, Bolt12OfferContext, PaymentContext, UnauthenticatedReceiveTlvs,
 };
@@ -57,14 +56,16 @@ use crate::events::{
 };
 use crate::events::{FundingInfo, PaidBolt12Invoice};
 use crate::ln::chan_utils::selected_commitment_sat_per_1000_weight;
-// Since this struct is returned in `list_channels` methods, expose it here in case users want to
-// construct one themselves.
+#[cfg(any(test, fuzzing))]
+use crate::ln::channel::QuiescentAction;
 use crate::ln::channel::{
 	self, hold_time_since, Channel, ChannelError, ChannelUpdateStatus, FundedChannel,
 	InboundV1Channel, OutboundV1Channel, PendingV2Channel, ReconnectionMsg, ShutdownResult,
 	UpdateFulfillCommitFetch, WithChannelContext,
 };
 use crate::ln::channel_state::ChannelDetails;
+#[cfg(splicing)]
+use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::{HandleTxCompleteResult, InteractiveTxMessageSendResult};
 use crate::ln::msgs;
@@ -82,7 +83,7 @@ use crate::ln::onion_utils::{
 	decode_fulfill_attribution_data, HTLCFailReason, LocalHTLCFailureReason,
 };
 use crate::ln::onion_utils::{process_fulfill_attribution_data, AttributionData};
-use crate::ln::our_peer_storage::EncryptedOurPeerStorage;
+use crate::ln::our_peer_storage::{EncryptedOurPeerStorage, PeerStorageMonitorHolder};
 #[cfg(test)]
 use crate::ln::outbound_payment;
 use crate::ln::outbound_payment::{
@@ -102,6 +103,7 @@ use crate::offers::offer::Offer;
 use crate::offers::parse::Bolt12SemanticError;
 use crate::offers::refund::Refund;
 use crate::offers::signer;
+use crate::offers::static_invoice::StaticInvoice;
 use crate::onion_message::async_payments::{
 	AsyncPaymentsMessage, AsyncPaymentsMessageHandler, HeldHtlcAvailable, OfferPaths,
 	OfferPathsRequest, ReleaseHeldHtlc, ServeStaticInvoice, StaticInvoicePersisted,
@@ -130,21 +132,12 @@ use crate::util::logger::{Level, Logger, WithContext};
 use crate::util::scid_utils::fake_scid;
 use crate::util::ser::{
 	BigSize, FixedLengthReader, LengthReadable, MaybeReadable, Readable, ReadableArgs, VecWriter,
-	Writeable, Writer,
+	WithoutLength, Writeable, Writer,
 };
 use crate::util::wakers::{Future, Notifier};
 
-#[cfg(all(test, async_payments))]
+#[cfg(test)]
 use crate::blinded_path::payment::BlindedPaymentPath;
-#[cfg(async_payments)]
-use {
-	crate::blinded_path::message::BlindedMessagePath,
-	crate::offers::offer::Amount,
-	crate::offers::static_invoice::{
-		StaticInvoice, StaticInvoiceBuilder,
-		DEFAULT_RELATIVE_EXPIRY as STATIC_INVOICE_DEFAULT_RELATIVE_EXPIRY,
-	},
-};
 
 #[cfg(feature = "dnssec")]
 use {
@@ -450,7 +443,7 @@ pub(super) struct PendingAddHTLCInfo {
 	// Note that this may be an outbound SCID alias for the associated channel.
 	prev_short_channel_id: u64,
 	prev_htlc_id: u64,
-	prev_counterparty_node_id: Option<PublicKey>,
+	prev_counterparty_node_id: PublicKey,
 	prev_channel_id: ChannelId,
 	prev_funding_outpoint: OutPoint,
 	prev_user_channel_id: u128,
@@ -512,6 +505,7 @@ struct ClaimableHTLC {
 impl From<&ClaimableHTLC> for events::ClaimedHTLC {
 	fn from(val: &ClaimableHTLC) -> Self {
 		events::ClaimedHTLC {
+			counterparty_node_id: val.prev_hop.counterparty_node_id,
 			channel_id: val.prev_hop.channel_id,
 			user_channel_id: val.prev_hop.user_channel_id.unwrap_or(0),
 			cltv_expiry: val.cltv_expiry,
@@ -670,7 +664,7 @@ impl_writeable_tlv_based_enum!(SentHTLCId,
 
 // (src_channel_id, src_counterparty_node_id, src_funding_outpoint, src_chan_id, src_user_chan_id)
 type PerSourcePendingForward =
-	(u64, Option<PublicKey>, OutPoint, ChannelId, u128, Vec<(PendingHTLCInfo, u64)>);
+	(u64, PublicKey, OutPoint, ChannelId, u128, Vec<(PendingHTLCInfo, u64)>);
 
 type FailedHTLCForward = (HTLCSource, PaymentHash, HTLCFailReason, HTLCHandlingFailureType);
 
@@ -933,9 +927,19 @@ struct ClaimingPayment {
 	sender_intended_value: Option<u64>,
 	onion_fields: Option<RecipientOnionFields>,
 	payment_id: Option<PaymentId>,
+	/// When we claim and generate a [`Event::PaymentClaimed`], we want to block any
+	/// payment-preimage-removing RAA [`ChannelMonitorUpdate`]s until the [`Event::PaymentClaimed`]
+	/// is handled, ensuring we can regenerate the event on restart. We pick a random channel to
+	/// block and store it here.
+	///
+	/// Note that once we disallow downgrades to 0.1 we should be able to simply use
+	/// [`Self::htlcs`] to generate this rather than storing it here (as we won't need the funding
+	/// outpoint), allowing us to remove this field.
+	durable_preimage_channel: Option<(OutPoint, PublicKey, ChannelId)>,
 }
 impl_writeable_tlv_based!(ClaimingPayment, {
 	(0, amount_msat, required),
+	(1, durable_preimage_channel, option),
 	(2, payment_purpose, required),
 	(4, receiver_node_id, required),
 	(5, htlcs, optional_vec),
@@ -1082,6 +1086,16 @@ impl ClaimablePayments {
 					.or_insert_with(|| {
 						let htlcs = payment.htlcs.iter().map(events::ClaimedHTLC::from).collect();
 						let sender_intended_value = payment.htlcs.first().map(|htlc| htlc.total_msat);
+						// Pick an "arbitrary" channel to block RAAs on until the `PaymentSent`
+						// event is processed, specifically the last channel to get claimed.
+						let durable_preimage_channel = payment.htlcs.last().map_or(None, |htlc| {
+							if let Some(node_id) = htlc.prev_hop.counterparty_node_id {
+								Some((htlc.prev_hop.outpoint, node_id, htlc.prev_hop.channel_id))
+							} else {
+								None
+							}
+						});
+						debug_assert!(durable_preimage_channel.is_some());
 						ClaimingPayment {
 							amount_msat: payment.htlcs.iter().map(|source| source.value).sum(),
 							payment_purpose: payment.purpose,
@@ -1090,6 +1104,7 @@ impl ClaimablePayments {
 							sender_intended_value,
 							onion_fields: payment.onion_fields,
 							payment_id: Some(payment_id),
+							durable_preimage_channel,
 						}
 					}).clone();
 
@@ -1201,7 +1216,6 @@ pub(crate) enum MonitorUpdateCompletionAction {
 	/// stored for later processing.
 	FreeOtherChannelImmediately {
 		downstream_counterparty_node_id: PublicKey,
-		downstream_funding_outpoint: OutPoint,
 		blocking_action: RAAMonitorUpdateBlockingAction,
 		downstream_channel_id: ChannelId,
 	},
@@ -1216,11 +1230,8 @@ impl_writeable_tlv_based_enum_upgradable!(MonitorUpdateCompletionAction,
 	// *immediately*. However, for simplicity we implement read/write here.
 	(1, FreeOtherChannelImmediately) => {
 		(0, downstream_counterparty_node_id, required),
-		(2, downstream_funding_outpoint, required),
 		(4, blocking_action, upgradable_required),
-		// Note that by the time we get past the required read above, downstream_funding_outpoint will be
-		// filled in, so we can safely unwrap it here.
-		(5, downstream_channel_id, (default_value, ChannelId::v1_from_funding_outpoint(downstream_funding_outpoint.0.unwrap()))),
+		(5, downstream_channel_id, required),
 	},
 	(2, EmitEventAndFreeOtherChannel) => {
 		(0, event, upgradable_required),
@@ -1237,17 +1248,21 @@ impl_writeable_tlv_based_enum_upgradable!(MonitorUpdateCompletionAction,
 pub(crate) enum EventCompletionAction {
 	ReleaseRAAChannelMonitorUpdate {
 		counterparty_node_id: PublicKey,
-		channel_funding_outpoint: OutPoint,
+		// Was required until LDK 0.2. Always filled in as `Some`.
+		channel_funding_outpoint: Option<OutPoint>,
 		channel_id: ChannelId,
 	},
 }
 impl_writeable_tlv_based_enum!(EventCompletionAction,
 	(0, ReleaseRAAChannelMonitorUpdate) => {
-		(0, channel_funding_outpoint, required),
+		(0, channel_funding_outpoint, option),
 		(2, counterparty_node_id, required),
-		// Note that by the time we get past the required read above, channel_funding_outpoint will be
-		// filled in, so we can safely unwrap it here.
-		(3, channel_id, (default_value, ChannelId::v1_from_funding_outpoint(channel_funding_outpoint.0.unwrap()))),
+		(3, channel_id, (default_value, {
+			if channel_funding_outpoint.is_none() {
+				Err(DecodeError::InvalidValue)?
+			}
+			ChannelId::v1_from_funding_outpoint(channel_funding_outpoint.unwrap())
+		})),
 	}
 );
 
@@ -1258,7 +1273,7 @@ impl_writeable_tlv_based_enum!(EventCompletionAction,
 /// drop this and merge the two, however doing so may break upgrades for nodes which have pending
 /// forwarded payments.
 struct HTLCClaimSource {
-	counterparty_node_id: Option<PublicKey>,
+	counterparty_node_id: PublicKey,
 	funding_txo: OutPoint,
 	channel_id: ChannelId,
 	htlc_id: u64,
@@ -1267,7 +1282,7 @@ struct HTLCClaimSource {
 impl From<&MPPClaimHTLCSource> for HTLCClaimSource {
 	fn from(o: &MPPClaimHTLCSource) -> HTLCClaimSource {
 		HTLCClaimSource {
-			counterparty_node_id: Some(o.counterparty_node_id),
+			counterparty_node_id: o.counterparty_node_id,
 			funding_txo: o.funding_txo,
 			channel_id: o.channel_id,
 			htlc_id: o.htlc_id,
@@ -1277,8 +1292,8 @@ impl From<&MPPClaimHTLCSource> for HTLCClaimSource {
 
 #[derive(Debug)]
 pub(crate) struct PendingMPPClaim {
-	channels_without_preimage: Vec<(PublicKey, OutPoint, ChannelId)>,
-	channels_with_preimage: Vec<(PublicKey, OutPoint, ChannelId)>,
+	channels_without_preimage: Vec<(PublicKey, ChannelId)>,
+	channels_with_preimage: Vec<(PublicKey, ChannelId)>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -2959,6 +2974,7 @@ pub(super) const MAX_UNFUNDED_CHANNEL_PEERS: usize = 50;
 /// This constant defines the upper limit for the size of data
 /// that can be stored for a peer. It is set to 1024 bytes (1 kilobyte)
 /// to prevent excessive resource consumption.
+#[cfg(not(test))]
 const MAX_PEER_STORAGE_SIZE: usize = 1024;
 
 /// The maximum number of peers which we do not have a (funded) channel with. Once we reach this
@@ -4436,14 +4452,13 @@ where
 	#[cfg(splicing)]
 	#[rustfmt::skip]
 	pub fn splice_channel(
-		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, our_funding_contribution_satoshis: i64,
-		our_funding_inputs: Vec<(TxIn, Transaction, Weight)>, change_script: Option<ScriptBuf>,
-		funding_feerate_per_kw: u32, locktime: Option<u32>,
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: Option<u32>,
 	) -> Result<(), APIError> {
 		let mut res = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
 			let result = self.internal_splice_channel(
-				channel_id, counterparty_node_id, our_funding_contribution_satoshis, our_funding_inputs, change_script, funding_feerate_per_kw, locktime
+				channel_id, counterparty_node_id, contribution, funding_feerate_per_kw, locktime
 			);
 			res = result;
 			match res {
@@ -4458,9 +4473,7 @@ where
 	#[cfg(splicing)]
 	fn internal_splice_channel(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
-		our_funding_contribution_satoshis: i64,
-		our_funding_inputs: Vec<(TxIn, Transaction, Weight)>, change_script: Option<ScriptBuf>,
-		funding_feerate_per_kw: u32, locktime: Option<u32>,
+		contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: Option<u32>,
 	) -> Result<(), APIError> {
 		let per_peer_state = self.per_peer_state.read().unwrap();
 
@@ -4481,13 +4494,8 @@ where
 			hash_map::Entry::Occupied(mut chan_phase_entry) => {
 				let locktime = locktime.unwrap_or_else(|| self.current_best_block().height);
 				if let Some(chan) = chan_phase_entry.get_mut().as_funded_mut() {
-					let msg = chan.splice_channel(
-						our_funding_contribution_satoshis,
-						our_funding_inputs,
-						change_script,
-						funding_feerate_per_kw,
-						locktime,
-					)?;
+					let msg =
+						chan.splice_channel(contribution, funding_feerate_per_kw, locktime)?;
 					peer_state.pending_msg_events.push(MessageSendEvent::SendSpliceInit {
 						node_id: *counterparty_node_id,
 						msg,
@@ -5099,7 +5107,7 @@ where
 		)
 	}
 
-	#[cfg(all(test, async_payments))]
+	#[cfg(test)]
 	pub(crate) fn test_modify_pending_payment<Fn>(&self, payment_id: &PaymentId, mut callback: Fn)
 	where
 		Fn: FnMut(&mut PendingOutboundPayment),
@@ -5229,7 +5237,6 @@ where
 		)
 	}
 
-	#[cfg(async_payments)]
 	fn check_refresh_async_receive_offer_cache(&self, timer_tick_occurred: bool) {
 		let peers = self.get_peers_for_blinded_path();
 		let channels = self.list_usable_channels();
@@ -5253,27 +5260,24 @@ where
 		}
 	}
 
-	#[cfg(all(test, async_payments))]
+	#[cfg(test)]
 	pub(crate) fn test_check_refresh_async_receive_offers(&self) {
 		self.check_refresh_async_receive_offer_cache(false);
 	}
 
 	/// Should be called after handling an [`Event::PersistStaticInvoice`], where the `Responder`
 	/// comes from [`Event::PersistStaticInvoice::invoice_persisted_path`].
-	#[cfg(async_payments)]
 	pub fn static_invoice_persisted(&self, invoice_persisted_path: Responder) {
 		self.flow.static_invoice_persisted(invoice_persisted_path);
 	}
 
 	/// Forwards a [`StaticInvoice`] in response to an [`Event::StaticInvoiceRequested`].
-	#[cfg(async_payments)]
 	pub fn send_static_invoice(
 		&self, invoice: StaticInvoice, responder: Responder,
 	) -> Result<(), Bolt12SemanticError> {
 		self.flow.enqueue_static_invoice(invoice, responder)
 	}
 
-	#[cfg(async_payments)]
 	fn initiate_async_payment(
 		&self, invoice: &StaticInvoice, payment_id: PaymentId,
 	) -> Result<(), Bolt12PaymentError> {
@@ -5323,7 +5327,6 @@ where
 		res
 	}
 
-	#[cfg(async_payments)]
 	fn send_payment_for_static_invoice(
 		&self, payment_id: PaymentId,
 	) -> Result<(), Bolt12PaymentError> {
@@ -5598,42 +5601,48 @@ where
 			Err($api_err)
 		} } }
 
-		let funding_txo;
-		let (mut chan, msg_opt) = match peer_state.channel_by_id.remove(&temporary_channel_id)
-			.map(Channel::into_unfunded_outbound_v1)
-		{
-			Some(Ok(mut chan)) => {
-				match find_funding_output(&chan) {
-					Ok(found_funding_txo) => funding_txo = found_funding_txo,
-					Err(err) => {
-						let chan_err = ChannelError::close(err.to_owned());
-						let api_err = APIError::APIMisuseError { err: err.to_owned() };
-						return abandon_chan!(chan_err, api_err, chan);
+		let mut chan = match peer_state.channel_by_id.entry(temporary_channel_id) {
+			hash_map::Entry::Occupied(chan) => {
+				if !chan.get().ready_to_fund() {
+					return Err(APIError::APIMisuseError {
+						err: format!("Channel {temporary_channel_id} with counterparty {counterparty_node_id} is not an unfunded, outbound channel ready to fund"),
+					});
+				}
+				match chan.remove().into_unfunded_outbound_v1() {
+					Ok(chan) => chan,
+					Err(chan) => {
+						debug_assert!(false, "ready_to_fund guarantees into_unfunded_outbound_v1 will succeed");
+						peer_state.channel_by_id.insert(temporary_channel_id, chan);
+						return Err(APIError::APIMisuseError {
+							err: "Invalid state, please report this bug".to_owned(),
+						});
 					},
 				}
+			},
+			hash_map::Entry::Vacant(_) => {
+				return Err(APIError::ChannelUnavailable {
+					err: format!("Channel {temporary_channel_id} with counterparty {counterparty_node_id} not found"),
+				});
+			},
+		};
 
-				let logger = WithChannelContext::from(&self.logger, &chan.context, None);
-				let funding_res = chan.get_funding_created(funding_transaction, funding_txo, is_batch_funding, &&logger);
-				match funding_res {
-					Ok(funding_msg) => (chan, funding_msg),
-					Err((mut chan, chan_err)) => {
-						let api_err = APIError::ChannelUnavailable { err: "Signer refused to sign the initial commitment transaction".to_owned() };
-						return abandon_chan!(chan_err, api_err, chan);
-					}
-				}
+		let funding_txo = match find_funding_output(&chan) {
+			Ok(found_funding_txo) => found_funding_txo,
+			Err(err) => {
+				let chan_err = ChannelError::close(err.to_owned());
+				let api_err = APIError::APIMisuseError { err: err.to_owned() };
+				return abandon_chan!(chan_err, api_err, chan);
 			},
-			Some(Err(chan)) => {
-				peer_state.channel_by_id.insert(temporary_channel_id, chan);
-				return Err(APIError::APIMisuseError {
-					err: format!(
-						"Channel with id {} for the passed counterparty node_id {} is not an unfunded, outbound V1 channel",
-						temporary_channel_id, counterparty_node_id),
-				})
-			},
-			None => return Err(APIError::ChannelUnavailable {err: format!(
-				"Channel with id {} not found for the passed counterparty node_id {}",
-				temporary_channel_id, counterparty_node_id),
-				}),
+		};
+
+		let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+		let funding_res = chan.get_funding_created(funding_transaction, funding_txo, is_batch_funding, &&logger);
+		let (mut chan, msg_opt) = match funding_res {
+			Ok(funding_msg) => (chan, funding_msg),
+			Err((mut chan, chan_err)) => {
+				let api_err = APIError::ChannelUnavailable { err: "Signer refused to sign the initial commitment transaction".to_owned() };
+				return abandon_chan!(chan_err, api_err, chan);
+			}
 		};
 
 		match peer_state.channel_by_id.entry(chan.context.channel_id()) {
@@ -5901,6 +5910,126 @@ where
 		result
 	}
 
+	/// Handles a signed funding transaction generated by interactive transaction construction and
+	/// provided by the client. Should only be called in response to a [`FundingTransactionReadyForSigning`]
+	/// event.
+	///
+	/// Do NOT broadcast the funding transaction yourself. When we have safely received our
+	/// counterparty's signature(s) the funding transaction will automatically be broadcast via the
+	/// [`BroadcasterInterface`] provided when this `ChannelManager` was constructed.
+	///
+	/// `SIGHASH_ALL` MUST be used for all signatures when providing signatures, otherwise your
+	/// funds can be held hostage!
+	///
+	/// LDK checks the following:
+	///  * Each input spends an output that is one of P2WPKH, P2WSH, or P2TR.
+	///    These were already checked by LDK when the inputs to be contributed were provided.
+	///  * All signatures use the `SIGHASH_ALL` sighash type.
+	///  * P2WPKH and P2TR key path spends are valid (verifies signatures)
+	///
+	/// NOTE:
+	///  * When checking P2WSH spends, LDK tries to decode 70-72 byte witness elements as ECDSA
+	///    signatures with a sighash flag. If the internal DER-decoding fails, then LDK just
+	///    assumes it wasn't a signature and carries with checks. If the element can be decoded
+	///    as an ECDSA signature, the the sighash flag must be `SIGHASH_ALL`.
+	///  * When checking P2TR script-path spends, LDK assumes all elements of exactly 65 bytes
+	///    with the last byte matching any valid sighash flag byte are schnorr signatures and checks
+	///    that the sighash type is `SIGHASH_ALL`. If the last byte is not any valid sighash flag, the
+	///    element is assumed not to be a signature and is ignored. Elements of 64 bytes are not
+	///    checked because if they were schnorr signatures then they would implicitly be `SIGHASH_DEFAULT`
+	///    which is an alias of `SIGHASH_ALL`.
+	///
+	/// Returns [`ChannelUnavailable`] when a channel is not found or an incorrect
+	/// `counterparty_node_id` is provided.
+	///
+	/// Returns [`APIMisuseError`] when a channel is not in a state where it is expecting funding
+	/// signatures or if any of the checks described above fail.
+	///
+	/// [`FundingTransactionReadyForSigning`]: events::Event::FundingTransactionReadyForSigning
+	/// [`ChannelUnavailable`]: APIError::ChannelUnavailable
+	/// [`APIMisuseError`]: APIError::APIMisuseError
+	pub fn funding_transaction_signed(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, transaction: Transaction,
+	) -> Result<(), APIError> {
+		let mut result = Ok(());
+		PersistenceNotifierGuard::optionally_notify(self, || {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex_opt = per_peer_state.get(counterparty_node_id);
+			if peer_state_mutex_opt.is_none() {
+				result = Err(APIError::ChannelUnavailable {
+					err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+				});
+				return NotifyOption::SkipPersistNoEvents;
+			}
+
+			let mut peer_state = peer_state_mutex_opt.unwrap().lock().unwrap();
+
+			match peer_state.channel_by_id.get_mut(channel_id) {
+				Some(channel) => match channel.as_funded_mut() {
+					Some(chan) => {
+						let witnesses: Vec<_> = transaction
+							.input
+							.into_iter()
+							.map(|input| input.witness)
+							.filter(|witness| witness.is_empty())
+							.collect();
+						match chan.funding_transaction_signed(witnesses) {
+							Ok((Some(tx_signatures), funding_tx_opt)) => {
+								if let Some(funding_tx) = funding_tx_opt {
+									self.broadcast_interactive_funding(chan, &funding_tx);
+								}
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTxSignatures {
+										node_id: *counterparty_node_id,
+										msg: tx_signatures,
+									},
+								);
+								return NotifyOption::DoPersist;
+							},
+							Err(err) => {
+								result = Err(err);
+								return NotifyOption::SkipPersistNoEvents;
+							},
+							_ => {
+								return NotifyOption::SkipPersistNoEvents;
+							},
+						}
+					},
+					None => {
+						result = Err(APIError::APIMisuseError {
+							err: format!(
+								"Channel with id {} not expecting funding signatures",
+								channel_id
+							),
+						});
+						return NotifyOption::SkipPersistNoEvents;
+					},
+				},
+				None => {
+					result = Err(APIError::ChannelUnavailable {
+						err: format!(
+							"Channel with id {} not found for the passed counterparty node_id {}",
+							channel_id, counterparty_node_id
+						),
+					});
+					return NotifyOption::SkipPersistNoEvents;
+				},
+			}
+		});
+
+		result
+	}
+
+	fn broadcast_interactive_funding(
+		&self, channel: &mut FundedChannel<SP>, funding_tx: &Transaction,
+	) {
+		self.tx_broadcaster.broadcast_transactions(&[funding_tx]);
+		{
+			let mut pending_events = self.pending_events.lock().unwrap();
+			emit_channel_pending_event!(pending_events, channel);
+		}
+	}
+
 	/// Atomically applies partial updates to the [`ChannelConfig`] of the given channels.
 	///
 	/// Once the updates are applied, each eligible channel (advertised with a known short channel
@@ -6149,7 +6278,7 @@ where
 				user_channel_id: Some(payment.prev_user_channel_id),
 				outpoint: payment.prev_funding_outpoint,
 				channel_id: payment.prev_channel_id,
-				counterparty_node_id: payment.prev_counterparty_node_id,
+				counterparty_node_id: Some(payment.prev_counterparty_node_id),
 				htlc_id: payment.prev_htlc_id,
 				incoming_packet_shared_secret: payment.forward_info.incoming_shared_secret,
 				phantom_shared_secret: None,
@@ -6255,7 +6384,7 @@ where
 							&chan.context,
 							Some(update_add_htlc.payment_hash),
 						);
-						chan.can_accept_incoming_htlc(update_add_htlc, &self.fee_estimator, &logger)
+						chan.can_accept_incoming_htlc(&self.fee_estimator, &logger)
 					},
 				) {
 					Some(Ok(_)) => {},
@@ -6322,7 +6451,7 @@ where
 			// proposed to as a batch.
 			let pending_forwards = (
 				incoming_scid,
-				Some(incoming_counterparty_node_id),
+				incoming_counterparty_node_id,
 				incoming_funding_txo,
 				incoming_channel_id,
 				incoming_user_channel_id,
@@ -6511,7 +6640,7 @@ where
 								user_channel_id: Some(prev_user_channel_id),
 								channel_id: prev_channel_id,
 								outpoint: prev_funding_outpoint,
-								counterparty_node_id: prev_counterparty_node_id,
+								counterparty_node_id: Some(prev_counterparty_node_id),
 								htlc_id: prev_htlc_id,
 								incoming_packet_shared_secret: incoming_shared_secret,
 								phantom_shared_secret: phantom_ss,
@@ -6724,7 +6853,7 @@ where
 					let htlc_source = HTLCSource::PreviousHopData(HTLCPreviousHopData {
 						short_channel_id: prev_short_channel_id,
 						user_channel_id: Some(prev_user_channel_id),
-						counterparty_node_id: prev_counterparty_node_id,
+						counterparty_node_id: Some(prev_counterparty_node_id),
 						channel_id: prev_channel_id,
 						outpoint: prev_funding_outpoint,
 						htlc_id: prev_htlc_id,
@@ -7035,7 +7164,7 @@ where
 						prev_hop: HTLCPreviousHopData {
 							short_channel_id: prev_short_channel_id,
 							user_channel_id: Some(prev_user_channel_id),
-							counterparty_node_id: prev_counterparty_node_id,
+							counterparty_node_id: Some(prev_counterparty_node_id),
 							channel_id: prev_channel_id,
 							outpoint: prev_funding_outpoint,
 							htlc_id: prev_htlc_id,
@@ -7676,7 +7805,6 @@ where
 			self.pending_outbound_payments
 				.remove_stale_payments(duration_since_epoch, &self.pending_events);
 
-			#[cfg(async_payments)]
 			self.check_refresh_async_receive_offer_cache(true);
 
 			// Technically we don't need to do this here, but if we have holding cell entries in a
@@ -8065,7 +8193,7 @@ where
 			let pending_mpp_claim_ptr_opt = if sources.len() > 1 {
 				let mut channels_without_preimage = Vec::with_capacity(mpp_parts.len());
 				for part in mpp_parts.iter() {
-					let chan = (part.counterparty_node_id, part.funding_txo, part.channel_id);
+					let chan = (part.counterparty_node_id, part.channel_id);
 					if !channels_without_preimage.contains(&chan) {
 						channels_without_preimage.push(chan);
 					}
@@ -8080,13 +8208,12 @@ where
 			let payment_info = Some(PaymentClaimDetails { mpp_parts, claiming_payment });
 			for htlc in sources {
 				let this_mpp_claim =
-					pending_mpp_claim_ptr_opt.as_ref().and_then(|pending_mpp_claim| {
-						if let Some(cp_id) = htlc.prev_hop.counterparty_node_id {
-							let claim_ptr = PendingMPPClaimPointer(Arc::clone(pending_mpp_claim));
-							Some((cp_id, htlc.prev_hop.channel_id, claim_ptr))
-						} else {
-							None
-						}
+					pending_mpp_claim_ptr_opt.as_ref().map(|pending_mpp_claim| {
+						let counterparty_id = htlc.prev_hop.counterparty_node_id;
+						let counterparty_id = counterparty_id
+							.expect("Prior to upgrading to LDK 0.1, all pending HTLCs forwarded by LDK 0.0.123 or before must be resolved. It appears at least one claimable payment was not resolved. Please downgrade to LDK 0.0.125 and resolve the HTLC by claiming the payment prior to upgrading.");
+						let claim_ptr = PendingMPPClaimPointer(Arc::clone(pending_mpp_claim));
+						(counterparty_id, htlc.prev_hop.channel_id, claim_ptr)
 					});
 				let raa_blocker = pending_mpp_claim_ptr_opt.as_ref().map(|pending_claim| {
 					RAAMonitorUpdateBlockingAction::ClaimedMPPPayment {
@@ -8168,6 +8295,14 @@ where
 			let short_to_chan_info = self.short_to_chan_info.read().unwrap();
 			short_to_chan_info.get(&prev_hop.short_channel_id).map(|(cp_id, _)| *cp_id)
 		});
+		let counterparty_node_id = if let Some(node_id) = counterparty_node_id {
+			node_id
+		} else {
+			let payment_hash: PaymentHash = payment_preimage.into();
+			panic!(
+				"Prior to upgrading to LDK 0.1, all pending HTLCs forwarded by LDK 0.0.123 or before must be resolved. It appears at least the HTLC with payment_hash {payment_hash} (preimage {payment_preimage}) was not resolved. Please downgrade to LDK 0.0.125 and resolve the HTLC prior to upgrading.",
+			);
+		};
 
 		let htlc_source = HTLCClaimSource {
 			counterparty_node_id,
@@ -8212,18 +8347,13 @@ where
 		const MISSING_MON_ERROR: &'static str =
 			"If we're going to claim an HTLC against a channel, we should always have *some* state for the channel, even if just the latest ChannelMonitor update_id. This failure indicates we need to claim an HTLC from a channel for which we did not have a ChannelMonitor at startup and didn't create one while running.";
 
-		// Note here that `peer_state_opt` is always `Some` if `prev_hop.counterparty_node_id` is
-		// `Some`. This is relied on in the closed-channel case below.
-		let mut peer_state_opt =
-			prev_hop.counterparty_node_id.as_ref().map(|counterparty_node_id| {
-				per_peer_state
-					.get(counterparty_node_id)
-					.map(|peer_mutex| peer_mutex.lock().unwrap())
-					.expect(MISSING_MON_ERROR)
-			});
+		let mut peer_state_lock = per_peer_state
+			.get(&prev_hop.counterparty_node_id)
+			.map(|peer_mutex| peer_mutex.lock().unwrap())
+			.expect(MISSING_MON_ERROR);
 
-		if let Some(peer_state_lock) = peer_state_opt.as_mut() {
-			let peer_state = &mut **peer_state_lock;
+		{
+			let peer_state = &mut *peer_state_lock;
 			if let hash_map::Entry::Occupied(mut chan_entry) =
 				peer_state.channel_by_id.entry(chan_id)
 			{
@@ -8261,7 +8391,7 @@ where
 								self,
 								prev_hop.funding_txo,
 								monitor_update,
-								peer_state_opt,
+								peer_state_lock,
 								peer_state,
 								per_peer_state,
 								chan
@@ -8274,18 +8404,21 @@ where
 								// payment claim from a `ChannelMonitor`. In some cases (MPP or
 								// if the HTLC was only recently removed) we make such claims
 								// after an HTLC has been removed from a channel entirely, and
-								// thus the RAA blocker has long since completed.
+								// thus the RAA blocker may have long since completed.
 								//
-								// In any other case, the RAA blocker must still be present and
-								// blocking RAAs.
-								debug_assert!(
-									during_init
-										|| peer_state
-											.actions_blocking_raa_monitor_updates
-											.get(&chan_id)
-											.unwrap()
-											.contains(&raa_blocker)
-								);
+								// However, its possible that the `ChannelMonitorUpdate` containing
+								// the preimage never completed and is still pending. In that case,
+								// we need to re-add the RAA blocker, which we do here. Handling
+								// the post-update action, below, will remove it again.
+								//
+								// In any other case (i.e. not during startup), the RAA blocker
+								// must still be present and blocking RAAs.
+								let actions = &mut peer_state.actions_blocking_raa_monitor_updates;
+								let actions_list = actions.entry(chan_id).or_insert_with(Vec::new);
+								if !actions_list.contains(&raa_blocker) {
+									debug_assert!(during_init);
+									actions_list.push(raa_blocker);
+								}
 							}
 							let action = if let Some(action) = action_opt {
 								action
@@ -8293,13 +8426,28 @@ where
 								return;
 							};
 
-							mem::drop(peer_state_opt);
+							// If there are monitor updates in flight, we may be in the case
+							// described above, replaying a claim on startup which needs an RAA
+							// blocker to remain blocked. Thus, in such a case we simply push the
+							// post-update action to the blocked list and move on.
+							// In any case, we should err on the side of caution and not process
+							// the post-update action no matter the situation.
+							let in_flight_mons = peer_state.in_flight_monitor_updates.get(&chan_id);
+							if in_flight_mons.map(|(_, mons)| !mons.is_empty()).unwrap_or(false) {
+								peer_state
+									.monitor_update_blocked_actions
+									.entry(chan_id)
+									.or_insert_with(Vec::new)
+									.push(action);
+								return;
+							}
+
+							mem::drop(peer_state_lock);
 
 							log_trace!(logger, "Completing monitor update completion action for channel {} as claim was redundant: {:?}",
 								chan_id, action);
 							if let MonitorUpdateCompletionAction::FreeOtherChannelImmediately {
 								downstream_counterparty_node_id: node_id,
-								downstream_funding_outpoint: _,
 								blocking_action: blocker,
 								downstream_channel_id: channel_id,
 							} = action
@@ -8346,18 +8494,7 @@ where
 			}
 		}
 
-		if prev_hop.counterparty_node_id.is_none() {
-			let payment_hash: PaymentHash = payment_preimage.into();
-			panic!(
-				"Prior to upgrading to LDK 0.1, all pending HTLCs forwarded by LDK 0.0.123 or before must be resolved. It appears at least the HTLC with payment_hash {} (preimage {}) was not resolved. Please downgrade to LDK 0.0.125 and resolve the HTLC prior to upgrading.",
-				payment_hash,
-				payment_preimage,
-			);
-		}
-		let counterparty_node_id =
-			prev_hop.counterparty_node_id.expect("Checked immediately above");
-		let mut peer_state = peer_state_opt
-			.expect("peer_state_opt is always Some when the counterparty_node_id is Some");
+		let peer_state = &mut *peer_state_lock;
 
 		let update_id = if let Some(latest_update_id) =
 			peer_state.closed_channel_monitor_update_ids.get_mut(&chan_id)
@@ -8381,11 +8518,11 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			channel_id: Some(prev_hop.channel_id),
 		};
 
-		// Note that we do process the completion action here. This totally could be a
-		// duplicate claim, but we have no way of knowing without interrogating the
-		// `ChannelMonitor` we've provided the above update to. Instead, note that `Event`s are
-		// generally always allowed to be duplicative (and it's specifically noted in
-		// `PaymentForwarded`).
+		// We don't have any idea if this is a duplicate claim without interrogating the
+		// `ChannelMonitor`, so we just always queue up the completion action after the
+		// `ChannelMonitorUpdate` we're about to generate. This may result in a duplicate `Event`,
+		// but note that `Event`s are generally always allowed to be duplicative (and it's
+		// specifically noted in `PaymentForwarded`).
 		let (action_opt, raa_blocker_opt) = completion_action(None, false);
 
 		if let Some(raa_blocker) = raa_blocker_opt {
@@ -8401,7 +8538,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let payment_hash = payment_preimage.into();
 		let logger = WithContext::from(
 			&self.logger,
-			Some(counterparty_node_id),
+			Some(prev_hop.counterparty_node_id),
 			Some(chan_id),
 			Some(payment_hash),
 		);
@@ -8424,10 +8561,10 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			self,
 			prev_hop.funding_txo,
 			preimage_update,
-			peer_state,
+			peer_state_lock,
 			peer_state,
 			per_peer_state,
-			counterparty_node_id,
+			prev_hop.counterparty_node_id,
 			chan_id,
 			POST_CHANNEL_CLOSE
 		);
@@ -8483,7 +8620,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					"We don't support claim_htlc claims during startup - monitors may not be available yet");
 				debug_assert_eq!(next_channel_counterparty_node_id, path.hops[0].pubkey);
 				let ev_completion_action = EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
-					channel_funding_outpoint: next_channel_outpoint,
+					channel_funding_outpoint: Some(next_channel_outpoint),
 					channel_id: next_channel_id,
 					counterparty_node_id: path.hops[0].pubkey,
 				};
@@ -8587,7 +8724,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							if let Some(other_chan) = chan_to_release {
 								(Some(MonitorUpdateCompletionAction::FreeOtherChannelImmediately {
 									downstream_counterparty_node_id: other_chan.counterparty_node_id,
-									downstream_funding_outpoint: other_chan.funding_txo,
 									downstream_channel_id: other_chan.channel_id,
 									blocking_action: other_chan.blocking_action,
 								}), None)
@@ -8661,17 +8797,17 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 										if *pending_claim == claim_ptr {
 											let mut pending_claim_state_lock = pending_claim.0.lock().unwrap();
 											let pending_claim_state = &mut *pending_claim_state_lock;
-											pending_claim_state.channels_without_preimage.retain(|(cp, op, cid)| {
+											pending_claim_state.channels_without_preimage.retain(|(cp, cid)| {
 												let this_claim =
 													*cp == counterparty_node_id && *cid == chan_id;
 												if this_claim {
-													pending_claim_state.channels_with_preimage.push((*cp, *op, *cid));
+													pending_claim_state.channels_with_preimage.push((*cp, *cid));
 													false
 												} else { true }
 											});
 											if pending_claim_state.channels_without_preimage.is_empty() {
-												for (cp, op, cid) in pending_claim_state.channels_with_preimage.iter() {
-													let freed_chan = (*cp, *op, *cid, blocker.clone());
+												for (cp, cid) in pending_claim_state.channels_with_preimage.iter() {
+													let freed_chan = (*cp, *cid, blocker.clone());
 													freed_channels.push(freed_chan);
 												}
 											}
@@ -8695,6 +8831,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						sender_intended_value: sender_intended_total_msat,
 						onion_fields,
 						payment_id,
+						durable_preimage_channel,
 					}) = payment {
 						let event = events::Event::PaymentClaimed {
 							payment_hash,
@@ -8706,7 +8843,18 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							onion_fields,
 							payment_id,
 						};
-						let event_action = (event, None);
+						let action = if let Some((outpoint, counterparty_node_id, channel_id))
+							= durable_preimage_channel
+						{
+							Some(EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
+								channel_funding_outpoint: Some(outpoint),
+								counterparty_node_id,
+								channel_id,
+							})
+						} else {
+							None
+						};
+						let event_action = (event, action);
 						let mut pending_events = self.pending_events.lock().unwrap();
 						// If we're replaying a claim on startup we may end up duplicating an event
 						// that's already in our queue, so check before we push another one. The
@@ -8723,17 +8871,17 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					self.pending_events.lock().unwrap().push_back((event, None));
 					if let Some(unblocked) = downstream_counterparty_and_funding_outpoint {
 						self.handle_monitor_update_release(
-							unblocked.counterparty_node_id, unblocked.funding_txo,
-							unblocked.channel_id, Some(unblocked.blocking_action),
+							unblocked.counterparty_node_id,
+							unblocked.channel_id,
+							Some(unblocked.blocking_action),
 						);
 					}
 				},
 				MonitorUpdateCompletionAction::FreeOtherChannelImmediately {
-					downstream_counterparty_node_id, downstream_funding_outpoint, downstream_channel_id, blocking_action,
+					downstream_counterparty_node_id, downstream_channel_id, blocking_action,
 				} => {
 					self.handle_monitor_update_release(
 						downstream_counterparty_node_id,
-						downstream_funding_outpoint,
 						downstream_channel_id,
 						Some(blocking_action),
 					);
@@ -8741,8 +8889,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			}
 		}
 
-		for (node_id, funding_outpoint, channel_id, blocker) in freed_channels {
-			self.handle_monitor_update_release(node_id, funding_outpoint, channel_id, Some(blocker));
+		for (node_id, channel_id, blocker) in freed_channels {
+			self.handle_monitor_update_release(node_id, channel_id, Some(blocker));
 		}
 	}
 
@@ -8756,7 +8904,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		funding_broadcastable: Option<Transaction>,
 		channel_ready: Option<msgs::ChannelReady>, announcement_sigs: Option<msgs::AnnouncementSignatures>,
 		tx_signatures: Option<msgs::TxSignatures>, tx_abort: Option<msgs::TxAbort>,
-	) -> (Option<(u64, Option<PublicKey>, OutPoint, ChannelId, u128, Vec<(PendingHTLCInfo, u64)>)>, Option<(u64, Vec<msgs::UpdateAddHTLC>)>) {
+	) -> (Option<(u64, PublicKey, OutPoint, ChannelId, u128, Vec<(PendingHTLCInfo, u64)>)>, Option<(u64, Vec<msgs::UpdateAddHTLC>)>) {
 		let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 		log_trace!(logger, "Handling channel resumption for channel {} with {} RAA, {} commitment update, {} pending forwards, {} pending update_add_htlcs, {}broadcasting funding, {} channel ready, {} announcement, {} tx_signatures, {} tx_abort",
 			&channel.context.channel_id(),
@@ -8776,7 +8924,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let mut htlc_forwards = None;
 		if !pending_forwards.is_empty() {
 			htlc_forwards = Some((
-				short_channel_id, Some(channel.context.get_counterparty_node_id()),
+				short_channel_id, channel.context.get_counterparty_node_id(),
 				channel.funding.get_funding_txo().unwrap(), channel.context.channel_id(),
 				channel.context.get_user_id(), pending_forwards
 			));
@@ -8795,6 +8943,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				msg,
 			});
 		}
+		// TODO(dual_funding): For async signing support we need to hold back `tx_signatures` until the `commitment_signed` is ready.
 		if let Some(msg) = tx_signatures {
 			pending_msg_events.push(MessageSendEvent::SendTxSignatures {
 				node_id: counterparty_node_id,
@@ -8852,6 +9001,46 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			} else {
 				log_info!(logger, "Broadcasting funding transaction with txid {}", tx.compute_txid());
 				self.tx_broadcaster.broadcast_transactions(&[&tx]);
+			}
+		}
+
+		if let Some(signing_session) = &mut channel.interactive_tx_signing_session {
+			if signing_session.local_inputs_count() > 0
+				&& signing_session.holder_tx_signatures().is_none()
+			{
+				let mut pending_events = self.pending_events.lock().unwrap();
+				let unsigned_transaction = signing_session.unsigned_tx().build_unsigned_tx();
+				let event_action = (
+					Event::FundingTransactionReadyForSigning {
+						unsigned_transaction,
+						counterparty_node_id,
+						channel_id: channel.context.channel_id(),
+						user_channel_id: channel.context.get_user_id(),
+					},
+					None,
+				);
+
+				if pending_events.contains(&event_action) {
+					debug_assert!(false, "FundingTransactionReadyForSigning should not have been queued already");
+				} else {
+					pending_events.push_back(event_action);
+				}
+			} else if signing_session.local_inputs_count() == 0 && signing_session.holder_tx_signatures().is_none() {
+				match channel.funding_transaction_signed(vec![]) {
+					Ok((Some(tx_signatures), funding_tx_opt)) => {
+						if let Some(funding_tx) = funding_tx_opt {
+							self.broadcast_interactive_funding(channel, &funding_tx);
+						}
+						pending_msg_events.push(MessageSendEvent::SendTxSignatures {
+							node_id: counterparty_node_id,
+							msg: tx_signatures,
+						});
+					},
+					Ok((None, _)) => {
+						debug_assert!(false, "If our tx_signatures is empty, then we should send it first!");
+					},
+					Err(err) => debug_assert!(false, "We should not error here but we got: {:?}", err),
+				}
 			}
 		}
 
@@ -9198,7 +9387,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 
 					// Inbound V2 channels with contributed inputs are not considered unfunded.
 					if let Some(unfunded_chan) = chan.as_unfunded_v2() {
-						if unfunded_chan.funding_negotiation_context.our_funding_contribution_satoshis > 0 {
+						if unfunded_chan.funding_negotiation_context.our_funding_contribution > SignedAmount::ZERO {
 							continue;
 						}
 					}
@@ -9516,7 +9705,54 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		};
 
 		log_trace!(logger, "Got valid {}-byte peer backup from {}", decrypted.len(), peer_node_id);
+		let per_peer_state = self.per_peer_state.read().unwrap();
 
+		let mut cursor = io::Cursor::new(decrypted);
+		let mon_list = <Vec<PeerStorageMonitorHolder> as Readable>::read(&mut cursor)
+			.unwrap_or_else(|e| {
+				// This should NEVER happen.
+				debug_assert!(false);
+				log_debug!(self.logger, "Unable to unpack the retrieved peer storage {:?}", e);
+				Vec::new()
+			});
+
+		for mon_holder in mon_list.iter() {
+			let peer_state_mutex = match per_peer_state.get(&mon_holder.counterparty_node_id) {
+				Some(mutex) => mutex,
+				None => {
+					log_debug!(
+						logger,
+						"Not able to find peer_state for the counterparty {}, channel_id {}",
+						log_pubkey!(mon_holder.counterparty_node_id),
+						mon_holder.channel_id
+					);
+					continue;
+				},
+			};
+
+			let peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &*peer_state_lock;
+
+			match peer_state.channel_by_id.get(&mon_holder.channel_id) {
+				Some(chan) => {
+					if let Some(funded_chan) = chan.as_funded() {
+						if funded_chan.get_revoked_counterparty_commitment_transaction_number()
+							> mon_holder.min_seen_secret
+						{
+							panic!(
+								"Lost channel state for channel {}.\n\
+								Received peer storage with a more recent state than what our node had.\n\
+								Use the FundRecoverer to initiate a force close and sweep the funds.",
+								&mon_holder.channel_id
+							);
+						}
+					}
+				},
+				None => {
+					log_debug!(logger, "Found an unknown channel {}", &mon_holder.channel_id);
+				},
+			}
+		}
 		Ok(())
 	}
 
@@ -9542,6 +9778,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			), ChannelId([0; 32])));
 		}
 
+		#[cfg(not(test))]
 		if msg.data.len() > MAX_PEER_STORAGE_SIZE {
 			log_debug!(logger, "Sending warning to peer and ignoring peer storage request from {} as its over 1KiB", log_pubkey!(counterparty_node_id));
 
@@ -9730,11 +9967,11 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					peer_state.pending_msg_events.push(msg_send_event);
 				};
 				if negotiation_complete {
-					let (commitment_signed, funding_ready_for_sig_event_opt) = match chan_entry
+					let commitment_signed = match chan_entry
 						.get_mut()
 						.funding_tx_constructed(&self.logger)
 					{
-						Ok((commitment_signed, event)) => (commitment_signed, event),
+						Ok(commitment_signed) => commitment_signed,
 						Err(tx_abort) => {
 							if chan_entry.get().is_funded() {
 								peer_state.pending_msg_events.push(MessageSendEvent::SendTxAbort {
@@ -9751,10 +9988,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							}
 						},
 					};
-					if let Some(funding_ready_for_sig_event) = funding_ready_for_sig_event_opt {
-						let mut pending_events = self.pending_events.lock().unwrap();
-						pending_events.push_back((funding_ready_for_sig_event, None));
-					}
 					peer_state.pending_msg_events.push(MessageSendEvent::UpdateHTLCs {
 						node_id: counterparty_node_id,
 						channel_id: msg.channel_id,
@@ -9793,8 +10026,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			hash_map::Entry::Occupied(mut chan_entry) => {
 				match chan_entry.get_mut().as_funded_mut() {
 					Some(chan) => {
-						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
-						let (funding_tx_opt, tx_signatures_opt) = try_channel_entry!(self, peer_state, chan.tx_signatures(msg, &&logger), chan_entry);
+						let (funding_tx_opt, tx_signatures_opt) = try_channel_entry!(self, peer_state, chan.tx_signatures(msg), chan_entry);
 						if let Some(tx_signatures) = tx_signatures_opt {
 							peer_state.pending_msg_events.push(MessageSendEvent::SendTxSignatures {
 								node_id: *counterparty_node_id,
@@ -10449,23 +10681,22 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 											"Failed to forward incoming HTLC: detected duplicate intercepted payment over short channel id {}",
 											scid
 										);
+										let routing = &forward_info.routing;
 										let htlc_source =
 											HTLCSource::PreviousHopData(HTLCPreviousHopData {
 												short_channel_id: prev_short_channel_id,
 												user_channel_id: Some(prev_user_channel_id),
-												counterparty_node_id: prev_counterparty_node_id,
+												counterparty_node_id: Some(
+													prev_counterparty_node_id,
+												),
 												outpoint: prev_funding_outpoint,
 												channel_id: prev_channel_id,
 												htlc_id: prev_htlc_id,
 												incoming_packet_shared_secret: forward_info
 													.incoming_shared_secret,
 												phantom_shared_secret: None,
-												blinded_failure: forward_info
-													.routing
-													.blinded_failure(),
-												cltv_expiry: forward_info
-													.routing
-													.incoming_cltv_expiry(),
+												blinded_failure: routing.blinded_failure(),
+												cltv_expiry: routing.incoming_cltv_expiry(),
 											});
 
 										let payment_hash = forward_info.payment_hash;
@@ -10525,16 +10756,20 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	#[rustfmt::skip]
 	fn raa_monitor_updates_held(&self,
 		actions_blocking_raa_monitor_updates: &BTreeMap<ChannelId, Vec<RAAMonitorUpdateBlockingAction>>,
-		channel_funding_outpoint: OutPoint, channel_id: ChannelId, counterparty_node_id: PublicKey
+		channel_id: ChannelId, counterparty_node_id: PublicKey,
 	) -> bool {
 		actions_blocking_raa_monitor_updates
 			.get(&channel_id).map(|v| !v.is_empty()).unwrap_or(false)
 		|| self.pending_events.lock().unwrap().iter().any(|(_, action)| {
-			action == &Some(EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
-				channel_funding_outpoint,
-				channel_id,
-				counterparty_node_id,
-			})
+			if let Some(EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
+				channel_funding_outpoint: _,
+				channel_id: ev_channel_id,
+				counterparty_node_id: ev_counterparty_node_id
+			}) = action {
+				*ev_channel_id == channel_id && *ev_counterparty_node_id == counterparty_node_id
+			} else {
+				false
+			}
 		})
 	}
 
@@ -10547,14 +10782,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			let mut peer_state_lck = peer_state_mtx.lock().unwrap();
 			let peer_state = &mut *peer_state_lck;
 
-			if let Some(chan) = peer_state.channel_by_id.get(&channel_id) {
-				return self.raa_monitor_updates_held(
-					&peer_state.actions_blocking_raa_monitor_updates,
-					chan.funding().get_funding_txo().unwrap(),
-					channel_id,
-					counterparty_node_id,
-				);
-			}
+			assert!(peer_state.channel_by_id.contains_key(&channel_id));
+			return self.raa_monitor_updates_held(
+				&peer_state.actions_blocking_raa_monitor_updates,
+				channel_id,
+				counterparty_node_id,
+			);
 		}
 		false
 	}
@@ -10574,11 +10807,9 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
 						let funding_txo_opt = chan.funding.get_funding_txo();
-						let mon_update_blocked = if let Some(funding_txo) = funding_txo_opt {
-							self.raa_monitor_updates_held(
-								&peer_state.actions_blocking_raa_monitor_updates, funding_txo, msg.channel_id,
-								*counterparty_node_id)
-						} else { false };
+						let mon_update_blocked = self.raa_monitor_updates_held(
+							&peer_state.actions_blocking_raa_monitor_updates, msg.channel_id,
+							*counterparty_node_id);
 						let (htlcs_to_fail, monitor_update_opt) = try_channel_entry!(self, peer_state,
 							chan.revoke_and_ack(&msg, &self.fee_estimator, &&logger, mon_update_blocked), chan_entry);
 						if let Some(monitor_update) = monitor_update_opt {
@@ -11132,6 +11363,22 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							}
 						}
 					},
+					MonitorEvent::CommitmentTxConfirmed(_) => {
+						let per_peer_state = self.per_peer_state.read().unwrap();
+						if let Some(peer_state_mutex) = per_peer_state.get(&counterparty_node_id) {
+							let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+							let peer_state = &mut *peer_state_lock;
+							if let hash_map::Entry::Occupied(chan_entry) =
+								peer_state.channel_by_id.entry(channel_id)
+							{
+								let reason = ClosureReason::CommitmentTxConfirmed;
+								let err = ChannelError::Close((reason.to_string(), reason));
+								let mut chan = chan_entry.remove();
+								let (_, e) = convert_channel_err!(self, peer_state, err, &mut chan);
+								failed_channels.push((Err(e), counterparty_node_id));
+							}
+						}
+					},
 					MonitorEvent::Completed { channel_id, monitor_update_id, .. } => {
 						self.channel_monitor_updated(
 							&channel_id,
@@ -11463,7 +11710,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							&self.logger, Some(*counterparty_node_id), Some(*channel_id), None
 						);
 
-						match chan.propose_quiescence(&&logger) {
+						match chan.propose_quiescence(&&logger, QuiescentAction::DoNothing) {
 							Ok(None) => {},
 							Ok(Some(stfu)) => {
 								peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
@@ -11856,9 +12103,9 @@ where
 	L::Target: Logger,
 {
 	#[cfg(not(c_bindings))]
-	create_offer_builder!(self, OfferBuilder<DerivedMetadata, secp256k1::All>);
+	create_offer_builder!(self, OfferBuilder<'_, DerivedMetadata, secp256k1::All>);
 	#[cfg(not(c_bindings))]
-	create_refund_builder!(self, RefundBuilder<secp256k1::All>);
+	create_refund_builder!(self, RefundBuilder<'_, secp256k1::All>);
 
 	#[cfg(c_bindings)]
 	create_offer_builder!(self, OfferWithDerivedMetadataBuilder);
@@ -11870,7 +12117,6 @@ where
 	/// interactively building a [`StaticInvoice`] with the static invoice server.
 	///
 	/// Useful for posting offers to receive payments later, such as posting an offer on a website.
-	#[cfg(async_payments)]
 	pub fn get_async_receive_offer(&self) -> Result<Offer, ()> {
 		let (offer, needs_persist) = self.flow.get_async_receive_offer()?;
 		if needs_persist {
@@ -11881,79 +12127,17 @@ where
 		Ok(offer)
 	}
 
-	/// Create an offer for receiving async payments as an often-offline recipient.
-	///
-	/// Instead of using this method, it is preferable to call
-	/// [`Self::set_paths_to_static_invoice_server`] and retrieve the automatically built offer via
-	/// [`Self::get_async_receive_offer`].
-	///
-	/// If you want to build the [`StaticInvoice`] manually using this method instead, you MUST:
-	/// 1. Provide at least 1 [`BlindedMessagePath`] terminating at an always-online node that will
-	///    serve the [`StaticInvoice`] created from this offer on our behalf.
-	/// 2. Use [`Self::create_static_invoice_builder`] to create a [`StaticInvoice`] from this
-	///    [`Offer`] plus the returned [`Nonce`], and provide the static invoice to the
-	///    aforementioned always-online node.
-	#[cfg(async_payments)]
-	pub fn create_async_receive_offer_builder(
-		&self, message_paths_to_always_online_node: Vec<BlindedMessagePath>,
-	) -> Result<(OfferBuilder<DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
-		let entropy = &*self.entropy_source;
-		self.flow.create_async_receive_offer_builder(entropy, message_paths_to_always_online_node)
-	}
-
-	/// Creates a [`StaticInvoiceBuilder`] from the corresponding [`Offer`] and [`Nonce`] that were
-	/// created via [`Self::create_async_receive_offer_builder`]. If `relative_expiry` is unset, the
-	/// invoice's expiry will default to [`STATIC_INVOICE_DEFAULT_RELATIVE_EXPIRY`].
-	///
-	/// Instead of using this method to manually build the invoice, it is preferable to set
-	/// [`Self::set_paths_to_static_invoice_server`] and retrieve the automatically built offer via
-	/// [`Self::get_async_receive_offer`].
-	#[cfg(async_payments)]
-	pub fn create_static_invoice_builder<'a>(
-		&self, offer: &'a Offer, offer_nonce: Nonce, relative_expiry: Option<Duration>,
-	) -> Result<StaticInvoiceBuilder<'a>, Bolt12SemanticError> {
-		let entropy = &*self.entropy_source;
-		let amount_msat = offer.amount().and_then(|amount| match amount {
-			Amount::Bitcoin { amount_msats } => Some(amount_msats),
-			Amount::Currency { .. } => None,
-		});
-
-		let relative_expiry = relative_expiry.unwrap_or(STATIC_INVOICE_DEFAULT_RELATIVE_EXPIRY);
-		let relative_expiry_secs: u32 = relative_expiry.as_secs().try_into().unwrap_or(u32::MAX);
-
-		let created_at = self.duration_since_epoch();
-		let payment_secret = inbound_payment::create_for_spontaneous_payment(
-			&self.inbound_payment_key,
-			amount_msat,
-			relative_expiry_secs,
-			created_at.as_secs(),
-			None,
-		)
-		.map_err(|()| Bolt12SemanticError::InvalidAmount)?;
-
-		self.flow.create_static_invoice_builder(
-			&self.router,
-			entropy,
-			offer,
-			offer_nonce,
-			payment_secret,
-			relative_expiry_secs,
-			self.list_usable_channels(),
-			self.get_peers_for_blinded_path(),
-		)
-	}
-
 	/// Sets the [`BlindedMessagePath`]s that we will use as an async recipient to interactively build
 	/// [`Offer`]s with a static invoice server, so the server can serve [`StaticInvoice`]s to payers
 	/// on our behalf when we're offline.
 	///
 	/// This method only needs to be called once when the server first takes on the recipient as a
 	/// client, or when the paths change, e.g. if the paths are set to expire at a particular time.
-	#[cfg(async_payments)]
 	pub fn set_paths_to_static_invoice_server(
 		&self, paths_to_static_invoice_server: Vec<BlindedMessagePath>,
 	) -> Result<(), ()> {
-		self.flow.set_paths_to_static_invoice_server(paths_to_static_invoice_server)?;
+		let peers = self.get_peers_for_blinded_path();
+		self.flow.set_paths_to_static_invoice_server(paths_to_static_invoice_server, peers)?;
 
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		Ok(())
@@ -12354,7 +12538,6 @@ where
 	/// The provided `recipient_id` must uniquely identify the recipient, and will be surfaced later
 	/// when the recipient provides us with a static invoice to persist and serve to payers on their
 	/// behalf.
-	#[cfg(async_payments)]
 	pub fn blinded_paths_for_async_recipient(
 		&self, recipient_id: Vec<u8>, relative_expiry: Option<Duration>,
 	) -> Result<Vec<BlindedMessagePath>, ()> {
@@ -12362,7 +12545,6 @@ where
 		self.flow.blinded_paths_for_async_recipient(recipient_id, relative_expiry, peers)
 	}
 
-	#[cfg(any(test, async_payments))]
 	pub(super) fn duration_since_epoch(&self) -> Duration {
 		#[cfg(not(feature = "std"))]
 		let now = Duration::from_secs(self.highest_seen_timestamp.load(Ordering::Acquire) as u64);
@@ -12394,7 +12576,12 @@ where
 			.collect::<Vec<_>>()
 	}
 
-	#[cfg(all(test, async_payments))]
+	#[cfg(test)]
+	pub(super) fn test_get_peers_for_blinded_path(&self) -> Vec<MessageForwardNode> {
+		self.get_peers_for_blinded_path()
+	}
+
+	#[cfg(test)]
 	/// Creates multi-hop blinded payment paths for the given `amount_msats` by delegating to
 	/// [`Router::create_blinded_payment_paths`].
 	pub(super) fn test_create_blinded_payment_paths(
@@ -12563,10 +12750,10 @@ where
 	/// operation. It will double-check that nothing *else* is also blocking the same channel from
 	/// making progress and then let any blocked [`ChannelMonitorUpdate`]s fly.
 	#[rustfmt::skip]
-	fn handle_monitor_update_release(&self, counterparty_node_id: PublicKey,
-		channel_funding_outpoint: OutPoint, channel_id: ChannelId,
-		mut completed_blocker: Option<RAAMonitorUpdateBlockingAction>) {
-
+	fn handle_monitor_update_release(
+		&self, counterparty_node_id: PublicKey, channel_id: ChannelId,
+		mut completed_blocker: Option<RAAMonitorUpdateBlockingAction>,
+	) {
 		let logger = WithContext::from(
 			&self.logger, Some(counterparty_node_id), Some(channel_id), None
 		);
@@ -12585,7 +12772,7 @@ where
 				}
 
 				if self.raa_monitor_updates_held(&peer_state.actions_blocking_raa_monitor_updates,
-					channel_funding_outpoint, channel_id, counterparty_node_id) {
+					channel_id, counterparty_node_id) {
 					// Check that, while holding the peer lock, we don't have anything else
 					// blocking monitor updates for this channel. If we do, release the monitor
 					// update(s) when those blockers complete.
@@ -12597,7 +12784,7 @@ where
 				if let hash_map::Entry::Occupied(mut chan_entry) = peer_state.channel_by_id.entry(
 					channel_id) {
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
-						debug_assert_eq!(chan.funding.get_funding_txo().unwrap(), channel_funding_outpoint);
+						let channel_funding_outpoint = chan.funding_outpoint();
 						if let Some((monitor_update, further_update_exists)) = chan.unblock_next_blocked_monitor_update() {
 							log_debug!(logger, "Unlocking monitor updating for channel {} and updating monitor",
 								channel_id);
@@ -12627,16 +12814,11 @@ where
 		for action in actions {
 			match action {
 				EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
-					channel_funding_outpoint,
+					channel_funding_outpoint: _,
 					channel_id,
 					counterparty_node_id,
 				} => {
-					self.handle_monitor_update_release(
-						counterparty_node_id,
-						channel_funding_outpoint,
-						channel_id,
-						None,
-					);
+					self.handle_monitor_update_release(counterparty_node_id, channel_id, None);
 				},
 			}
 		}
@@ -12896,9 +13078,8 @@ where
 
 		// While we usually refresh the AsyncReceiveOfferCache on a timer, we also want to start
 		// interactively building offers as soon as we can after startup. We can't start building offers
-		// until we have some peer connection(s) to send onion messages over, so as a minor optimization
+		// until we have some peer connection(s) to receive onion messages over, so as a minor optimization
 		// refresh the cache when a peer connects.
-		#[cfg(async_payments)]
 		self.check_refresh_async_receive_offer_cache(false);
 		res
 	}
@@ -13451,7 +13632,7 @@ where
 						htlc_id: htlc.prev_htlc_id,
 						incoming_packet_shared_secret: htlc.forward_info.incoming_shared_secret,
 						phantom_shared_secret: None,
-						counterparty_node_id: htlc.prev_counterparty_node_id,
+						counterparty_node_id: Some(htlc.prev_counterparty_node_id),
 						outpoint: htlc.prev_funding_outpoint,
 						channel_id: htlc.prev_channel_id,
 						blinded_failure: htlc.forward_info.routing.blinded_failure(),
@@ -14170,7 +14351,6 @@ where
 						log_trace!($logger, "Failed paying invoice: {:?}", e);
 						InvoiceError::from_string(format!("{:?}", e))
 					},
-					#[cfg(async_payments)]
 					Err(Bolt12PaymentError::BlindedPathCreationFailed) => {
 						let err_msg = "Failed to create a blinded path back to ourselves";
 						log_trace!($logger, "{}", err_msg);
@@ -14200,12 +14380,9 @@ where
 
 				let invoice_request = match self.flow.verify_invoice_request(invoice_request, context) {
 					Ok(InvreqResponseInstructions::SendInvoice(invoice_request)) => invoice_request,
-					Ok(InvreqResponseInstructions::SendStaticInvoice {
-						recipient_id: _recipient_id, invoice_id: _invoice_id
-					}) => {
-						#[cfg(async_payments)]
+					Ok(InvreqResponseInstructions::SendStaticInvoice { recipient_id, invoice_slot }) => {
 						self.pending_events.lock().unwrap().push_back((Event::StaticInvoiceRequested {
-							recipient_id: _recipient_id, invoice_id: _invoice_id, reply_path: responder
+							recipient_id, invoice_slot, reply_path: responder
 						}, None));
 
 						return None
@@ -14268,7 +14445,6 @@ where
 				let res = self.send_payment_for_verified_bolt12_invoice(&invoice, payment_id);
 				handle_pay_invoice_res!(res, invoice, logger);
 			},
-			#[cfg(async_payments)]
 			OffersMessage::StaticInvoice(invoice) => {
 				let payment_id = match context {
 					Some(OffersContext::OutboundPayment { payment_id, .. }) => payment_id,
@@ -14328,130 +14504,102 @@ where
 	L::Target: Logger,
 {
 	fn handle_offer_paths_request(
-		&self, _message: OfferPathsRequest, _context: AsyncPaymentsContext,
-		_responder: Option<Responder>,
+		&self, message: OfferPathsRequest, context: AsyncPaymentsContext,
+		responder: Option<Responder>,
 	) -> Option<(OfferPaths, ResponseInstruction)> {
-		#[cfg(async_payments)]
-		{
-			let peers = self.get_peers_for_blinded_path();
-			let entropy = &*self.entropy_source;
-			let (message, reply_path_context) =
-				match self.flow.handle_offer_paths_request(_context, peers, entropy) {
-					Some(msg) => msg,
-					None => return None,
-				};
-			_responder.map(|resp| (message, resp.respond_with_reply_path(reply_path_context)))
-		}
-
-		#[cfg(not(async_payments))]
-		None
+		let peers = self.get_peers_for_blinded_path();
+		let (message, reply_path_context) =
+			match self.flow.handle_offer_paths_request(&message, context, peers) {
+				Some(msg) => msg,
+				None => return None,
+			};
+		responder.map(|resp| (message, resp.respond_with_reply_path(reply_path_context)))
 	}
 
 	fn handle_offer_paths(
-		&self, _message: OfferPaths, _context: AsyncPaymentsContext, _responder: Option<Responder>,
+		&self, message: OfferPaths, context: AsyncPaymentsContext, responder: Option<Responder>,
 	) -> Option<(ServeStaticInvoice, ResponseInstruction)> {
-		#[cfg(async_payments)]
-		{
-			let responder = match _responder {
-				Some(responder) => responder,
-				None => return None,
-			};
-			let (serve_static_invoice, reply_context) = match self.flow.handle_offer_paths(
-				_message,
-				_context,
-				responder.clone(),
-				self.get_peers_for_blinded_path(),
-				self.list_usable_channels(),
-				&*self.entropy_source,
-				&*self.router,
-			) {
-				Some((msg, ctx)) => (msg, ctx),
-				None => return None,
-			};
+		let responder = match responder {
+			Some(responder) => responder,
+			None => return None,
+		};
+		let (serve_static_invoice, reply_context) = match self.flow.handle_offer_paths(
+			message,
+			context,
+			responder.clone(),
+			self.get_peers_for_blinded_path(),
+			self.list_usable_channels(),
+			&*self.entropy_source,
+			&*self.router,
+		) {
+			Some((msg, ctx)) => (msg, ctx),
+			None => return None,
+		};
 
-			// We cached a new pending offer, so persist the cache.
-			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		// We cached a new pending offer, so persist the cache.
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 
-			let response_instructions = responder.respond_with_reply_path(reply_context);
-			return Some((serve_static_invoice, response_instructions));
-		}
-
-		#[cfg(not(async_payments))]
-		return None;
+		let response_instructions = responder.respond_with_reply_path(reply_context);
+		return Some((serve_static_invoice, response_instructions));
 	}
 
 	fn handle_serve_static_invoice(
-		&self, _message: ServeStaticInvoice, _context: AsyncPaymentsContext,
-		_responder: Option<Responder>,
+		&self, message: ServeStaticInvoice, context: AsyncPaymentsContext,
+		responder: Option<Responder>,
 	) {
-		#[cfg(async_payments)]
-		{
-			let responder = match _responder {
-				Some(resp) => resp,
-				None => return,
+		let responder = match responder {
+			Some(resp) => resp,
+			None => return,
+		};
+
+		let (recipient_id, invoice_slot) =
+			match self.flow.verify_serve_static_invoice_message(&message, context) {
+				Ok((recipient_id, inv_slot)) => (recipient_id, inv_slot),
+				Err(()) => return,
 			};
 
-			let (recipient_id, invoice_id) =
-				match self.flow.verify_serve_static_invoice_message(&_message, _context) {
-					Ok((recipient_id, inv_id)) => (recipient_id, inv_id),
-					Err(()) => return,
-				};
-
-			let mut pending_events = self.pending_events.lock().unwrap();
-			pending_events.push_back((
-				Event::PersistStaticInvoice {
-					invoice: _message.invoice,
-					invoice_slot: _message.invoice_slot,
-					recipient_id,
-					invoice_id,
-					invoice_persisted_path: responder,
-				},
-				None,
-			));
-		}
+		let mut pending_events = self.pending_events.lock().unwrap();
+		pending_events.push_back((
+			Event::PersistStaticInvoice {
+				invoice: message.invoice,
+				invoice_slot,
+				recipient_id,
+				invoice_persisted_path: responder,
+			},
+			None,
+		));
 	}
 
 	fn handle_static_invoice_persisted(
-		&self, _message: StaticInvoicePersisted, _context: AsyncPaymentsContext,
+		&self, _message: StaticInvoicePersisted, context: AsyncPaymentsContext,
 	) {
-		#[cfg(async_payments)]
-		{
-			let should_persist = self.flow.handle_static_invoice_persisted(_context);
-			if should_persist {
-				let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
-			}
+		let should_persist = self.flow.handle_static_invoice_persisted(context);
+		if should_persist {
+			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		}
 	}
 
 	fn handle_held_htlc_available(
-		&self, _message: HeldHtlcAvailable, _context: AsyncPaymentsContext,
-		_responder: Option<Responder>,
+		&self, _message: HeldHtlcAvailable, context: AsyncPaymentsContext,
+		responder: Option<Responder>,
 	) -> Option<(ReleaseHeldHtlc, ResponseInstruction)> {
-		#[cfg(async_payments)]
-		{
-			self.flow.verify_inbound_async_payment_context(_context).ok()?;
-			return _responder.map(|responder| (ReleaseHeldHtlc {}, responder.respond()));
-		}
-		#[cfg(not(async_payments))]
-		return None;
+		self.flow.verify_inbound_async_payment_context(context).ok()?;
+		return responder.map(|responder| (ReleaseHeldHtlc {}, responder.respond()));
 	}
 
-	fn handle_release_held_htlc(&self, _message: ReleaseHeldHtlc, _context: AsyncPaymentsContext) {
-		#[cfg(async_payments)]
-		{
-			let payment_id = match _context {
-				AsyncPaymentsContext::OutboundPayment { payment_id } => payment_id,
-				_ => return,
-			};
+	fn handle_release_held_htlc(&self, _message: ReleaseHeldHtlc, context: AsyncPaymentsContext) {
+		let payment_id = match context {
+			AsyncPaymentsContext::OutboundPayment { payment_id } => payment_id,
+			_ => return,
+		};
 
-			if let Err(e) = self.send_payment_for_static_invoice(payment_id) {
-				log_trace!(
-					self.logger,
-					"Failed to release held HTLC with payment id {}: {:?}",
-					payment_id,
-					e
-				);
-			}
+		if let Err(e) = self.send_payment_for_static_invoice(payment_id) {
+			log_trace!(
+				self.logger,
+				"Failed to release held HTLC with payment id {}: {:?}",
+				payment_id,
+				e
+			);
 		}
 	}
 
@@ -14962,7 +15110,7 @@ impl_writeable_tlv_based!(PendingAddHTLCInfo, {
 	// Note that by the time we get past the required read for type 6 above, prev_funding_outpoint will be
 	// filled in, so we can safely unwrap it here.
 	(7, prev_channel_id, (default_value, ChannelId::v1_from_funding_outpoint(prev_funding_outpoint.0.unwrap()))),
-	(9, prev_counterparty_node_id, option),
+	(9, prev_counterparty_node_id, required),
 });
 
 impl Writeable for HTLCForwardInfo {
@@ -15291,7 +15439,7 @@ where
 			(15, self.inbound_payment_id_secret, required),
 			(17, in_flight_monitor_updates, option),
 			(19, peer_storage_dir, optional_vec),
-			(21, self.flow.writeable_async_receive_offer_cache(), required),
+			(21, WithoutLength(&self.flow.writeable_async_receive_offer_cache()), required),
 		});
 
 		Ok(())
@@ -16410,7 +16558,9 @@ where
 									// `ChannelMonitor` is removed.
 									let compl_action =
 										EventCompletionAction::ReleaseRAAChannelMonitorUpdate {
-											channel_funding_outpoint: monitor.get_funding_txo(),
+											channel_funding_outpoint: Some(
+												monitor.get_funding_txo(),
+											),
 											channel_id: monitor.channel_id(),
 											counterparty_node_id: path.hops[0].pubkey,
 										};
@@ -16913,13 +17063,7 @@ where
 						let mut channels_without_preimage = payment_claim
 							.mpp_parts
 							.iter()
-							.map(|htlc_info| {
-								(
-									htlc_info.counterparty_node_id,
-									htlc_info.funding_txo,
-									htlc_info.channel_id,
-								)
-							})
+							.map(|htlc_info| (htlc_info.counterparty_node_id, htlc_info.channel_id))
 							.collect::<Vec<_>>();
 						// If we have multiple MPP parts which were received over the same channel,
 						// we only track it once as once we get a preimage durably in the
@@ -17105,6 +17249,10 @@ where
 								onion_fields: payment.onion_fields,
 								payment_id: Some(payment_id),
 							},
+							// Note that we don't bother adding a EventCompletionAction here to
+							// ensure the `PaymentClaimed` event is durable processed as this
+							// should only be hit for particularly old channels and we don't have
+							// enough information to generate such an action.
 							None,
 						));
 					}
@@ -17385,108 +17533,6 @@ mod tests {
 				assert_eq!(route.paths[0], *path);
 			},
 			_ => panic!("Unexpected event"),
-		}
-	}
-
-	#[test]
-	#[rustfmt::skip]
-	fn test_peer_storage() {
-		let chanmon_cfgs = create_chanmon_cfgs(2);
-		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-
-		create_announced_chan_between_nodes(&nodes, 0, 1);
-
-		let peer_storage_msg_events_node0 = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_msg_events();
-		let peer_storage_msg_events_node1 = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_msg_events();
-		assert_ne!(peer_storage_msg_events_node0.len(), 0);
-		assert_ne!(peer_storage_msg_events_node1.len(), 0);
-
-		match peer_storage_msg_events_node0[0] {
-			MessageSendEvent::SendPeerStorage { ref node_id, ref msg } => {
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-				nodes[1].node.handle_peer_storage(nodes[0].node.get_our_node_id(), msg.clone());
-			}
-			_ => panic!("Unexpected event"),
-		}
-
-		match peer_storage_msg_events_node1[0] {
-			MessageSendEvent::SendPeerStorage { ref node_id, ref msg } => {
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-				nodes[0].node.handle_peer_storage(nodes[1].node.get_our_node_id(), msg.clone());
-			}
-			_ => panic!("Unexpected event"),
-		}
-
-		nodes[0].node.peer_disconnected(nodes[1].node.get_our_node_id());
-		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
-
-		nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-			features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
-		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
-
-		let node_1_events = nodes[1].node.get_and_clear_pending_msg_events();
-		assert_eq!(node_1_events.len(), 2);
-
-		let node_0_events = nodes[0].node.get_and_clear_pending_msg_events();
-		assert_eq!(node_0_events.len(), 2);
-
-		for msg in node_1_events{
-			if let MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } = msg {
-				nodes[0].node.handle_channel_reestablish(nodes[1].node.get_our_node_id(), msg);
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			} else if let MessageSendEvent::SendPeerStorageRetrieval { ref node_id, ref msg } = msg {
-				nodes[0].node.handle_peer_storage_retrieval(nodes[1].node.get_our_node_id(), msg.clone());
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			} else {
-				panic!("Unexpected event")
-			}
-		}
-
-		for msg in node_0_events{
-			if let MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } = msg {
-				nodes[1].node.handle_channel_reestablish(nodes[0].node.get_our_node_id(), msg);
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			} else if let MessageSendEvent::SendPeerStorageRetrieval { ref node_id, ref msg } = msg {
-				nodes[1].node.handle_peer_storage_retrieval(nodes[0].node.get_our_node_id(), msg.clone());
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			} else {
-				panic!("Unexpected event")
-			}
-		}
-
-		let node_1_msg_events = nodes[1].node.get_and_clear_pending_msg_events();
-		let node_0_msg_events = nodes[0].node.get_and_clear_pending_msg_events();
-
-		assert_eq!(node_1_msg_events.len(), 3);
-		assert_eq!(node_0_msg_events.len(), 3);
-
-		for msg in node_1_msg_events {
-			if let MessageSendEvent::SendChannelReady { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			} else if let MessageSendEvent::SendAnnouncementSignatures { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			} else if let MessageSendEvent::SendChannelUpdate { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[0].node.get_our_node_id());
-			} else {
-				panic!("Unexpected event")
-			}
-		}
-
-		for msg in node_0_msg_events {
-			if let MessageSendEvent::SendChannelReady { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			} else if let MessageSendEvent::SendAnnouncementSignatures { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			} else if let MessageSendEvent::SendChannelUpdate { ref node_id, .. } = msg {
-				assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			} else {
-				panic!("Unexpected event")
-			}
 		}
 	}
 

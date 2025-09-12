@@ -26,6 +26,7 @@ use crate::ln::channelmanager::{
 	AChannelManager, ChainParameters, ChannelManager, ChannelManagerReadArgs, PaymentId,
 	RAACommitmentOrder, RecipientOnionFields, MIN_CLTV_EXPIRY_DELTA,
 };
+use crate::ln::funding::FundingTxInput;
 use crate::ln::msgs;
 use crate::ln::msgs::{
 	BaseMessageHandler, ChannelMessageHandler, MessageSendEvent, RoutingMessageHandler,
@@ -61,13 +62,11 @@ use bitcoin::pow::CompactTarget;
 use bitcoin::script::ScriptBuf;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::transaction::{self, Version as TxVersion};
-use bitcoin::transaction::{Sequence, Transaction, TxIn, TxOut};
-use bitcoin::witness::Witness;
-use bitcoin::{WPubkeyHash, Weight};
+use bitcoin::transaction::{Transaction, TxIn, TxOut};
+use bitcoin::WPubkeyHash;
 
 use crate::io;
 use crate::prelude::*;
-use crate::sign::P2WPKH_WITNESS_WEIGHT;
 use crate::sync::{Arc, LockTestExt, Mutex, RwLock};
 use alloc::rc::Rc;
 use core::cell::RefCell;
@@ -718,7 +717,7 @@ pub trait NodeHolder {
 		<Self::CM as AChannelManager>::MR,
 		<Self::CM as AChannelManager>::L,
 	>;
-	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor>;
+	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor<'_>>;
 }
 impl<H: NodeHolder> NodeHolder for &H {
 	type CM = H::CM;
@@ -737,7 +736,7 @@ impl<H: NodeHolder> NodeHolder for &H {
 	> {
 		(*self).node()
 	}
-	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor> {
+	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor<'_>> {
 		(*self).chain_monitor()
 	}
 }
@@ -746,7 +745,7 @@ impl<'a, 'b: 'a, 'c: 'b> NodeHolder for Node<'a, 'b, 'c> {
 	fn node(&self) -> &TestChannelManager<'b, 'c> {
 		&self.node
 	}
-	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor> {
+	fn chain_monitor(&self) -> Option<&test_utils::TestChainMonitor<'_>> {
 		Some(self.chain_monitor)
 	}
 }
@@ -1440,7 +1439,7 @@ fn internal_create_funding_transaction<'a, 'b, 'c>(
 /// Return the inputs (with prev tx), and the total witness weight for these inputs
 pub fn create_dual_funding_utxos_with_prev_txs(
 	node: &Node<'_, '_, '_>, utxo_values_in_satoshis: &[u64],
-) -> Vec<(TxIn, Transaction, Weight)> {
+) -> Vec<FundingTxInput> {
 	// Ensure we have unique transactions per node by using the locktime.
 	let tx = Transaction {
 		version: TxVersion::TWO,
@@ -1460,22 +1459,12 @@ pub fn create_dual_funding_utxos_with_prev_txs(
 			.collect(),
 	};
 
-	let mut inputs = vec![];
-	for i in 0..utxo_values_in_satoshis.len() {
-		inputs.push((
-			TxIn {
-				previous_output: OutPoint { txid: tx.compute_txid(), index: i as u16 }
-					.into_bitcoin_outpoint(),
-				script_sig: ScriptBuf::new(),
-				sequence: Sequence::ZERO,
-				witness: Witness::new(),
-			},
-			tx.clone(),
-			Weight::from_wu(P2WPKH_WITNESS_WEIGHT),
-		));
-	}
-
-	inputs
+	tx.output
+		.iter()
+		.enumerate()
+		.map(|(index, _)| index as u32)
+		.map(|vout| FundingTxInput::new_p2wpkh(tx.clone(), vout).unwrap())
+		.collect()
 }
 
 pub fn sign_funding_transaction<'a, 'b, 'c>(
@@ -2211,21 +2200,37 @@ macro_rules! check_closed_event {
 	};
 }
 
-pub fn handle_bump_htlc_event(node: &Node, count: usize) {
+pub fn handle_bump_events(node: &Node, expected_close: bool, expected_htlc_count: usize) {
 	let events = node.chain_monitor.chain_monitor.get_and_clear_pending_events();
-	assert_eq!(events.len(), count);
-	for event in events {
+	let mut close = false;
+	let mut htlc_count = 0;
+	for event in &events {
 		match event {
-			Event::BumpTransaction(bump_event) => {
-				if let BumpTransactionEvent::HTLCResolution { .. } = &bump_event {
-				} else {
-					panic!();
-				}
-				node.bump_tx_handler.handle_event(&bump_event);
+			Event::BumpTransaction(bump @ BumpTransactionEvent::ChannelClose { .. }) => {
+				close = true;
+				node.bump_tx_handler.handle_event(&bump);
 			},
-			_ => panic!(),
+			Event::BumpTransaction(bump @ BumpTransactionEvent::HTLCResolution { .. }) => {
+				htlc_count += 1;
+				node.bump_tx_handler.handle_event(&bump);
+			},
+			_ => panic!("Unexpected non-bump event: {:?}.", event),
 		}
 	}
+	assert_eq!(close, expected_close, "Expected a bump close event, found {:?}.", events);
+	assert_eq!(
+		htlc_count, expected_htlc_count,
+		"Expected {} bump HTLC events, found {:?}",
+		expected_htlc_count, events
+	);
+}
+
+pub fn handle_bump_close_event(node: &Node) {
+	handle_bump_events(node, true, 0);
+}
+
+pub fn handle_bump_htlc_event(node: &Node, count: usize) {
+	handle_bump_events(node, false, count);
 }
 
 pub fn close_channel<'a, 'b, 'c>(

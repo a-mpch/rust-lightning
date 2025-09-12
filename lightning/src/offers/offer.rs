@@ -646,7 +646,7 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 
 	/// A complete description of the purpose of the payment. Intended to be displayed to the user
 	/// but with the caveat that it has not been verified in any way.
-	pub fn description(&$self) -> Option<$crate::types::string::PrintableString> {
+	pub fn description(&$self) -> Option<$crate::types::string::PrintableString<'_>> {
 		$contents.description()
 	}
 
@@ -664,7 +664,7 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 
 	/// The issuer of the offer, possibly beginning with `user@domain` or `domain`. Intended to be
 	/// displayed to the user but with the caveat that it has not been verified in any way.
-	pub fn issuer(&$self) -> Option<$crate::types::string::PrintableString> {
+	pub fn issuer(&$self) -> Option<$crate::types::string::PrintableString<'_>> {
 		$contents.issuer()
 	}
 
@@ -802,7 +802,7 @@ impl Offer {
 
 #[cfg(test)]
 impl Offer {
-	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef {
+	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef<'_> {
 		self.contents.as_tlv_stream()
 	}
 }
@@ -848,7 +848,7 @@ impl OfferContents {
 		self.amount
 	}
 
-	pub fn description(&self) -> Option<PrintableString> {
+	pub fn description(&self) -> Option<PrintableString<'_>> {
 		self.description.as_ref().map(|description| PrintableString(description))
 	}
 
@@ -874,7 +874,7 @@ impl OfferContents {
 			.unwrap_or(false)
 	}
 
-	pub fn issuer(&self) -> Option<PrintableString> {
+	pub fn issuer(&self) -> Option<PrintableString<'_>> {
 		self.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
 	}
 
@@ -995,7 +995,7 @@ impl OfferContents {
 		}
 	}
 
-	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef {
+	pub(super) fn as_tlv_stream(&self) -> FullOfferTlvStreamRef<'_> {
 		let (currency, amount) = match &self.amount {
 			None => (None, None),
 			Some(Amount::Bitcoin { amount_msats }) => (None, Some(*amount_msats)),
@@ -1287,7 +1287,9 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 
 		let (issuer_signing_pubkey, paths) = match (issuer_id, paths) {
 			(None, None) => return Err(Bolt12SemanticError::MissingIssuerSigningPubkey),
-			(_, Some(paths)) if paths.is_empty() => return Err(Bolt12SemanticError::MissingPaths),
+			(None, Some(paths)) if paths.is_empty() => {
+				return Err(Bolt12SemanticError::MissingPaths)
+			},
 			(issuer_id, paths) => (issuer_id, paths),
 		};
 
@@ -2001,6 +2003,7 @@ mod tests {
 		}
 
 		let mut builder = OfferBuilder::new(pubkey(42));
+		builder.offer.issuer_signing_pubkey = None;
 		builder.offer.paths = Some(vec![]);
 
 		let offer = builder.build().unwrap();

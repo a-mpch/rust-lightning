@@ -233,6 +233,11 @@ impl_writeable_tlv_based_enum_legacy!(PaymentPurpose,
 /// Information about an HTLC that is part of a payment that can be claimed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedHTLC {
+	/// The counterparty of the channel.
+	///
+	/// This value will always be `None` for objects serialized with LDK versions prior to 0.2 and
+	/// `Some` otherwise.
+	pub counterparty_node_id: Option<PublicKey>,
 	/// The `channel_id` of the channel over which the HTLC was received.
 	pub channel_id: ChannelId,
 	/// The `user_channel_id` of the channel over which the HTLC was received. This is the value
@@ -263,6 +268,7 @@ impl_writeable_tlv_based!(ClaimedHTLC, {
 	(0, channel_id, required),
 	(1, counterparty_skimmed_fee_msat, (default_value, 0u64)),
 	(2, user_channel_id, required),
+	(3, counterparty_node_id, option),
 	(4, cltv_expiry, required),
 	(6, value_msat, required),
 });
@@ -400,7 +406,12 @@ pub enum ClosureReason {
 	/// was ready to be broadcast.
 	FundingBatchClosure,
 	/// One of our HTLCs timed out in a channel, causing us to force close the channel.
-	HTLCsTimedOut,
+	HTLCsTimedOut {
+		/// The payment hash of an HTLC that timed out.
+		///
+		/// Will be `None` for any event serialized by LDK prior to 0.2.
+		payment_hash: Option<PaymentHash>,
+	},
 	/// Our peer provided a feerate which violated our required minimum (fetched from our
 	/// [`FeeEstimator`] either as [`ConfirmationTarget::MinAllowedAnchorChannelRemoteFee`] or
 	/// [`ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee`]).
@@ -474,7 +485,12 @@ impl core::fmt::Display for ClosureReason {
 			ClosureReason::FundingBatchClosure => {
 				f.write_str("another channel in the same funding batch closed")
 			},
-			ClosureReason::HTLCsTimedOut => f.write_str("htlcs on the channel timed out"),
+			ClosureReason::HTLCsTimedOut { payment_hash: Some(hash) } => f.write_fmt(format_args!(
+				"HTLC(s) on the channel timed out (including the HTLC with payment hash {hash})",
+			)),
+			ClosureReason::HTLCsTimedOut { payment_hash: None } => {
+				f.write_fmt(format_args!("HTLC(s) on the channel timed out"))
+			},
 			ClosureReason::PeerFeerateTooLow {
 				peer_feerate_sat_per_kw,
 				required_feerate_sat_per_kw,
@@ -502,7 +518,9 @@ impl_writeable_tlv_based_enum_upgradable!(ClosureReason,
 	(15, FundingBatchClosure) => {},
 	(17, CounterpartyInitiatedCooperativeClosure) => {},
 	(19, LocallyInitiatedCooperativeClosure) => {},
-	(21, HTLCsTimedOut) => {},
+	(21, HTLCsTimedOut) => {
+		(1, payment_hash, option),
+	},
 	(23, PeerFeerateTooLow) => {
 		(0, peer_feerate_sat_per_kw, required),
 		(2, required_feerate_sat_per_kw, required),
@@ -1628,7 +1646,6 @@ pub enum Event {
 	///
 	/// [`ChannelManager::blinded_paths_for_async_recipient`]: crate::ln::channelmanager::ChannelManager::blinded_paths_for_async_recipient
 	/// [`ChannelManager::set_paths_to_static_invoice_server`]: crate::ln::channelmanager::ChannelManager::set_paths_to_static_invoice_server
-	#[cfg(async_payments)]
 	PersistStaticInvoice {
 		/// The invoice that should be persisted and later provided to payers when handling a future
 		/// [`Event::StaticInvoiceRequested`].
@@ -1644,16 +1661,11 @@ pub enum Event {
 		/// [`ChannelManager::blinded_paths_for_async_recipient`].
 		///
 		/// When an [`Event::StaticInvoiceRequested`] comes in for the invoice, this id will be surfaced
-		/// and can be used alongside the `invoice_id` to retrieve the invoice from the database.
-		recipient_id: Vec<u8>,
-		/// A random identifier for the invoice. When an [`Event::StaticInvoiceRequested`] comes in for
-		/// the invoice, this id will be surfaced and can be used alongside the `recipient_id` to
-		/// retrieve the invoice from the database.
+		/// and can be used alongside the `invoice_slot` to retrieve the invoice from the database.
 		///
-		/// Note that this id will remain the same for all invoice updates corresponding to a particular
-		/// offer that the recipient has cached.
-		invoice_id: u128,
-		/// Once the [`StaticInvoice`], `invoice_slot` and `invoice_id` are persisted,
+		///[`ChannelManager::blinded_paths_for_async_recipient`]: crate::ln::channelmanager::ChannelManager::blinded_paths_for_async_recipient
+		recipient_id: Vec<u8>,
+		/// Once the [`StaticInvoice`] and `invoice_slot` are persisted,
 		/// [`ChannelManager::static_invoice_persisted`] should be called with this responder to confirm
 		/// to the recipient that their [`Offer`] is ready to be used for async payments.
 		///
@@ -1669,28 +1681,73 @@ pub enum Event {
 	/// them via [`ChannelManager::set_paths_to_static_invoice_server`].
 	///
 	/// If we previously persisted a [`StaticInvoice`] from an [`Event::PersistStaticInvoice`] that
-	/// matches the below `recipient_id` and `invoice_id`, that invoice should be retrieved now
+	/// matches the below `recipient_id` and `invoice_slot`, that invoice should be retrieved now
 	/// and forwarded to the payer via [`ChannelManager::send_static_invoice`].
 	///
 	/// [`ChannelManager::blinded_paths_for_async_recipient`]: crate::ln::channelmanager::ChannelManager::blinded_paths_for_async_recipient
 	/// [`ChannelManager::set_paths_to_static_invoice_server`]: crate::ln::channelmanager::ChannelManager::set_paths_to_static_invoice_server
 	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	/// [`ChannelManager::send_static_invoice`]: crate::ln::channelmanager::ChannelManager::send_static_invoice
-	#[cfg(async_payments)]
 	StaticInvoiceRequested {
 		/// An identifier for the recipient previously surfaced in
-		/// [`Event::PersistStaticInvoice::recipient_id`]. Useful when paired with the `invoice_id` to
+		/// [`Event::PersistStaticInvoice::recipient_id`]. Useful when paired with the `invoice_slot` to
 		/// retrieve the [`StaticInvoice`] requested by the payer.
 		recipient_id: Vec<u8>,
-		/// A random identifier for the invoice being requested, previously surfaced in
-		/// [`Event::PersistStaticInvoice::invoice_id`]. Useful when paired with the `recipient_id` to
+		/// The slot number for the invoice being requested, previously surfaced in
+		/// [`Event::PersistStaticInvoice::invoice_slot`]. Useful when paired with the `recipient_id` to
 		/// retrieve the [`StaticInvoice`] requested by the payer.
-		invoice_id: u128,
+		invoice_slot: u16,
 		/// The path over which the [`StaticInvoice`] will be sent to the payer, which should be
 		/// provided to [`ChannelManager::send_static_invoice`] along with the invoice.
 		///
 		/// [`ChannelManager::send_static_invoice`]: crate::ln::channelmanager::ChannelManager::send_static_invoice
 		reply_path: Responder,
+	},
+	/// Indicates that a channel funding transaction constructed interactively is ready to be
+	/// signed. This event will only be triggered if at least one input was contributed.
+	///
+	/// The transaction contains all inputs and outputs provided by both parties including the
+	/// channel's funding output and a change output if applicable.
+	///
+	/// No part of the transaction should be changed before signing as the content of the transaction
+	/// has already been negotiated with the counterparty.
+	///
+	/// Each signature MUST use the `SIGHASH_ALL` flag to avoid invalidation of the initial commitment and
+	/// hence possible loss of funds.
+	///
+	/// After signing, call [`ChannelManager::funding_transaction_signed`] with the (partially) signed
+	/// funding transaction.
+	///
+	/// Generated in [`ChannelManager`] message handling.
+	///
+	/// # Failure Behavior and Persistence
+	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
+	/// returning `Err(ReplayEvent ())`), but will only be regenerated as needed after restarts.
+	///
+	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+	/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
+	FundingTransactionReadyForSigning {
+		/// The `channel_id` of the channel which you'll need to pass back into
+		/// [`ChannelManager::funding_transaction_signed`].
+		///
+		/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
+		channel_id: ChannelId,
+		/// The counterparty's `node_id`, which you'll need to pass back into
+		/// [`ChannelManager::funding_transaction_signed`].
+		///
+		/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
+		counterparty_node_id: PublicKey,
+		/// The `user_channel_id` value passed in for outbound channels, or for inbound channels if
+		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
+		/// `user_channel_id` will be randomized for inbound channels.
+		///
+		/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
+		user_channel_id: u128,
+		/// The unsigned transaction to be signed and passed back to
+		/// [`ChannelManager::funding_transaction_signed`].
+		///
+		/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
+		unsigned_transaction: Transaction,
 	},
 }
 
@@ -2123,16 +2180,19 @@ impl Writeable for Event {
 					(8, former_temporary_channel_id, required),
 				});
 			},
-			#[cfg(async_payments)]
 			&Event::PersistStaticInvoice { .. } => {
 				45u8.write(writer)?;
 				// No need to write these events because we can just restart the static invoice negotiation
 				// on startup.
 			},
-			#[cfg(async_payments)]
 			&Event::StaticInvoiceRequested { .. } => {
 				47u8.write(writer)?;
 				// Never write StaticInvoiceRequested events as buffered onion messages aren't serialized.
+			},
+			&Event::FundingTransactionReadyForSigning { .. } => {
+				49u8.write(writer)?;
+				// We never write out FundingTransactionReadyForSigning events as they will be regenerated when
+				// necessary.
 			},
 			// Note that, going forward, all new events must only write data inside of
 			// `write_tlv_fields`. Versions 0.0.101+ will ignore odd-numbered events that write
@@ -2711,11 +2771,11 @@ impl MaybeReadable for Event {
 				}))
 			},
 			// Note that we do not write a length-prefixed TLV for PersistStaticInvoice events.
-			#[cfg(async_payments)]
 			45u8 => Ok(None),
 			// Note that we do not write a length-prefixed TLV for StaticInvoiceRequested events.
-			#[cfg(async_payments)]
 			47u8 => Ok(None),
+			// Note that we do not write a length-prefixed TLV for FundingTransactionReadyForSigning events.
+			49u8 => Ok(None),
 			// Versions prior to 0.0.100 did not ignore odd types, instead returning InvalidValue.
 			// Version 0.0.100 failed to properly ignore odd types, possibly resulting in corrupt
 			// reads.
